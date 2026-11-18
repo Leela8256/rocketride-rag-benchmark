@@ -1,0 +1,88 @@
+{
+	"components": [
+		{
+			"id": "webhook_1",
+			"provider": "webhook",
+			"config": {
+				"hideForm": true,
+				"type": "webhook",
+				"mode": "Source"
+			}
+		},
+		{
+			"id": "parse_1",
+			"provider": "parse",
+			"config": {},
+			"input": [
+				{
+					"lane": "tags",
+					"from": "webhook_1"
+				}
+			]
+		},
+		{
+			"id": "preprocessor_1",
+			"provider": "preprocessor_langchain",
+			"config": {
+				"profile": "default",
+				"default": {
+					"splitter": "RecursiveCharacterTextSplitter",
+					"mode": "strlen"
+				}
+			},
+			"input": [
+				{
+					"lane": "text",
+					"from": "parse_1"
+				},
+				{
+					"lane": "text",
+					"from": "webhook_1"
+				}
+			]
+		},
+		{
+			"id": "embedding_1",
+			"provider": "embedding_transformer",
+			"config": {
+				"profile": "miniLM"
+			},
+			"input": [
+				{
+					"lane": "documents",
+					"from": "preprocessor_1"
+				}
+			]
+		},
+		{
+			"id": "postgres_1",
+			"provider": "postgres",
+			"config": {
+				"profile": "local",
+				"local": {
+					"host": "127.0.0.1",
+					"port": 5432,
+					"user": "postgres",
+					"password": "${ROCKETRIDE_PG_PASSWORD}",
+					"database": "ragbench",
+					"collection": "rr_chunks",
+					"similarity": "cosine"
+				}
+			},
+			"input": [
+				{
+					"lane": "documents",
+					"from": "embedding_1"
+				}
+			]
+		}
+	],
+	"source": "webhook_1",
+	"project_id": "48a0d262-b821-45a7-86e9-b8f0f153ad41",
+	"viewport": {
+		"x": 0,
+		"y": 0,
+		"zoom": 1
+	},
+	"version": 1
+}

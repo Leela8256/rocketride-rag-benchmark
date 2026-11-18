@@ -1,0 +1,16 @@
+# The warmed engine image plus the two Python packages the engine's own `postgres` node asks for.
+#
+# BASE is the engine image after one warm-up run (see infra/build_images.sh): the engine installs the packages of
+# the nodes a pipeline uses the first time it loads them, and the warm-up keeps them in the image so that no run
+# installs anything.
+#
+# The two packages are the ones nodes/store_postgres/requirements.txt names, unpinned as there. Everything already
+# in the image is passed to pip as a constraint, so this step can add packages but cannot change one.
+ARG BASE=ragbench-rocketride:warm
+FROM ${BASE}
+RUN ./engine -m pip freeze 2>/dev/null | grep -E '^[A-Za-z0-9_.-]+==' > /opt/rocketride/freeze-before-store.txt \
+    && ./engine -m pip install --no-cache-dir -c /opt/rocketride/freeze-before-store.txt psycopg2-binary pgvector \
+    && ./engine -m pip freeze 2>/dev/null | grep -E '^[A-Za-z0-9_.-]+==' > /opt/rocketride/freeze.txt \
+    && (diff /opt/rocketride/freeze-before-store.txt /opt/rocketride/freeze.txt || true) \
+    # The files of the release must still be the files of the release.
+    && sha256sum -c /opt/rocketride/release-files.sha256
