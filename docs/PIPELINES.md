@@ -132,7 +132,7 @@ index itself.
 | | RocketRide | LangGraph side |
 |---|---|---|
 | Transport | One websocket for all requests | One HTTP request each |
-| Load client of this benchmark | The RocketRide client SDK: one event loop, one connection | Python's `urllib` from a thread pool: a new connection for every request |
+| Load client of this benchmark | The RocketRide client SDK: one event loop, one connection | Python's `http.client` from a thread pool: one connection per worker thread, kept open ([lg_http.py](../harness/lg_http.py)) |
 | Concurrency inside | The task's threads (32 in the default plan; a task accepts 1 to 64) | The default thread pool of the process |
 
 The transport and the client belong to each stack as it is measured here. A request is timed by the client, from

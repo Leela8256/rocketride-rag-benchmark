@@ -5,7 +5,7 @@ finishes, the next is sent. Timing covers only those requests. Validation and wr
 has stopped.
 
   RocketRide   one task from use() on the ingestion pipe; every PDF is one pipe() object: open, write, close
-  LangGraph    one HTTP request per PDF: POST /v1/process/<pipeline>
+  LangGraph    one HTTP request per PDF: POST /v1/process/<pipeline>, over connections that stay open (lg_http.py)
 
 Usage: driver.py <cell label>
 """
@@ -19,10 +19,11 @@ import os
 import sys
 import time
 import traceback
-import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import lg_http
 
 ROOT = Path('/campaign')
 CORPUS = Path('/corpus')
@@ -55,15 +56,46 @@ def find_documents(obj):
     return None
 
 
-def chunks_and_vectors(arm, result):
-    """Ordered chunk texts and their vectors, in the same shape for both arms."""
+def read_result(arm, result):
+    """What a run without the store returned for one PDF.
+
+    Returns (texts, vectors, chunk numbers, documents lane present, problem). `problem` is None for a result and a
+    sentence for a response that is not one: not an object, an empty object, one that reports an error, or lists
+    of another shape.
+
+    A PDF without text is a result too. LangGraph then answers with an empty list of chunks. RocketRide answers
+    with its normal object (the properties of the file) without a list of documents, so for RocketRide any object
+    that reports no error and holds no documents is read as a PDF without text. The screening keeps such a PDF only
+    when LangGraph found no text in it either (finalize.py).
+    """
+    nothing = ([], [], [], False)
+    if not isinstance(result, dict):
+        return nothing + ('the response is a %s, not an object' % type(result).__name__,)
+    for key in ('error', 'errors'):
+        if result.get(key):
+            return nothing + ('the response reports %s: %s' % (key, str(result[key])[:200]),)
     if arm == 'rr':
         docs = find_documents(result)
         if docs is None:
-            return [], [], False
-        return [d['page_content'] for d in docs], [d['embedding'] for d in docs], True
-    output = result['output']
-    return [c['text'] for c in output['chunks']], output['vectors'], True
+            if not result:
+                return nothing + ('the response is an empty object',)
+            return nothing + (None,)                      # a PDF without text
+        if not all(isinstance(d, dict) and isinstance(d.get('page_content'), str) and isinstance(d.get('embedding'), list)
+                   for d in docs):
+            return nothing + ('an entry of the documents list is not a chunk with its vector',)
+        numbers = [(d.get('metadata') or {}).get('chunkId') for d in docs]
+        if not all(isinstance(n, int) and not isinstance(n, bool) for n in numbers):
+            numbers = list(range(len(docs)))              # the response carries no chunk numbers: the order is the number
+        return [d['page_content'] for d in docs], [d['embedding'] for d in docs], numbers, True, None
+    output = result.get('output')
+    chunks = output.get('chunks') if isinstance(output, dict) else None
+    vectors = output.get('vectors') if isinstance(output, dict) else None
+    if not isinstance(chunks, list) or not isinstance(vectors, list):
+        return nothing + ('the response holds no lists of chunks and vectors',)
+    if not all(isinstance(c, dict) and isinstance(c.get('text'), str) for c in chunks):
+        return nothing + ('an entry of the chunks list has no text',)
+    numbers = [c.get('index') if isinstance(c.get('index'), int) else i for i, c in enumerate(chunks)]
+    return [c['text'] for c in chunks], vectors, numbers, True, None
 
 
 def percentile(values, p):
@@ -90,15 +122,14 @@ def lg_request(port, name, body, pipeline):
         ('--%s\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\n'
          'Content-Type: application/pdf\r\n\r\n' % (boundary, name)).encode(),
         body, ('\r\n--%s--\r\n' % boundary).encode()])
-    request = urllib.request.Request(
-        'http://127.0.0.1:%d/v1/process/%s' % (port, pipeline), data=payload,
-        headers={'Content-Type': 'multipart/form-data; boundary=' + boundary})
-    with urllib.request.urlopen(request, timeout=1800) as response:
-        raw = response.read()
-        meta = {'response_bytes': len(raw),
-                'identity_ok': response.headers.get('X-Request-ID') == name,
-                'server_timing': response.headers.get('Server-Timing'),
-                'sha_ok': response.headers.get('X-Output-SHA256') == hashlib.sha256(raw).hexdigest()}
+    status, response, raw = lg_http.post(port, '/v1/process/' + pipeline, payload,
+                                         'multipart/form-data; boundary=' + boundary, 1800)
+    if status != 200:
+        raise RuntimeError('the service answered %d: %s' % (status, raw[:300].decode('utf-8', 'replace')))
+    meta = {'response_bytes': len(raw),
+            'identity_ok': response.getheader('X-Request-ID') == name,
+            'server_timing': response.getheader('Server-Timing'),
+            'sha_ok': response.getheader('X-Output-SHA256') == hashlib.sha256(raw).hexdigest()}
     return json.loads(raw), meta
 
 
@@ -112,17 +143,25 @@ def persist(out, arm, names, results, manifest):
     vectors = array.array('f')
     rows = []
     for name, result, meta in results:
-        texts, vecs, lane = chunks_and_vectors(arm, result)
-        ok = len(texts) == len(vecs) and all(len(v) == DIM and all(math.isfinite(x) for x in v) for v in vecs)
-        if arm == 'lg':
-            ok = ok and meta['identity_ok'] and meta['sha_ok'] and result['input']['filename'] == name
+        texts, vecs, numbers, lane, problem = read_result(arm, result)
+        ok = problem is None and len(texts) == len(vecs) and all(
+            isinstance(v, list) and len(v) == DIM and all(isinstance(x, (int, float)) and math.isfinite(x) for x in v) for v in vecs)
+        if arm == 'lg' and problem is None:
+            ok = ok and meta['identity_ok'] and meta['sha_ok'] and (result.get('input') or {}).get('filename') == name
+        if not ok:
+            texts, vecs, numbers = [], [], []           # nothing of a response that is not a result is kept as chunks
         if not texts:
             (out / 'empty-responses').mkdir(exist_ok=True)
-            save(out / 'empty-responses' / (name + '.json'), result)
+            (out / 'empty-responses' / (name + '.json')).write_text(json.dumps(result, indent=2, default=repr) + '\n')
         rows.append(dict(meta, doc=name, ok=bool(ok), documents_lane=lane, chunks=len(texts),
+                         # chunks: a PDF with text. empty: a PDF without text. not_a_result: an error or another shape.
+                         outcome='not_a_result' if not ok else 'chunks' if texts else 'empty',
+                         problem=problem if problem else None if ok else 'the chunks or vectors of the result are not valid',
                          chars=sum(len(t) for t in texts), vector_offset=len(vectors) // DIM,
                          input_sha256=manifest['sha256'][name],
-                         text_sha256=[hashlib.sha256(t.encode()).hexdigest() for t in texts]))
+                         text_sha256=[hashlib.sha256(t.encode()).hexdigest() for t in texts],
+                         # the number each chunk carries inside its document; the read-back compares it with the table
+                         chunk_numbers=numbers))
         if texts and QUERIES is not None:
             # One question per document: 12 words from the middle of one of its chunks, chosen by the file name.
             j = int(hashlib.sha256(name.encode()).hexdigest(), 16) % len(texts)
@@ -241,7 +280,7 @@ async def main(label):
 
     try:
         warmed = await asyncio.gather(*(asyncio.wait_for(request(n), 1800) for n in warm))
-        assert len(warmed) == 4 and (store or all(chunks_and_vectors(arm, r)[0] for _, r, _ in warmed)), 'warm-up returned no chunks'
+        assert len(warmed) == 4 and (store or all(read_result(arm, r)[0] for _, r, _ in warmed)), 'warm-up returned no chunks'
         save(out / 'sample-response.json', warmed[0][1])
         save(out / 'ready.json', {'epoch': time.time(), 'warm': warm})
         print('WARM_READY', label, flush=True)
@@ -295,12 +334,16 @@ async def main(label):
             'label': label, 'arm': arm, 'stage': cfg['stage'],
             'documents': len(rows), 'success': sum(r['ok'] for r in rows),
             'empty_documents': sum(r.get('chunks') == 0 for r in rows),
+            'pdfs_without_text': sum(r.get('outcome') == 'empty' for r in rows),
+            'responses_that_are_not_a_result': sum(r.get('outcome') == 'not_a_result' for r in rows),
             'chunks': sum(r.get('chunks') or 0 for r in rows), 'chars': sum(r.get('chars') or 0 for r in rows),
             'store': store, 'failures': len(failures),
             'wall_s': wall, 'docs_per_s': len(rows) / wall, 'cpu_s': cpu, 'cpu_s_per_doc': cpu / len(rows),
             'average_logical_cpus': cpu / wall,
             # CPU time of this client process (all its threads) during the timed requests.
             'client_cpu_s': own, 'client_average_cpus': own / wall,
+            # LangGraph side only: how many HTTP connections the client opened for all its requests.
+            'http': dict(lg_http.STATS) if arm == 'lg' else None,
             'cpu_by_service_s': {k: after['groups'][k]['cpu_s'] - v['cpu_s'] for k, v in before['groups'].items()},
             'latency_s': {'p50': percentile(latencies, .5), 'p95': percentile(latencies, .95), 'max': max(latencies)},
             'start_epoch': before['epoch'], 'end_epoch': after['epoch'],

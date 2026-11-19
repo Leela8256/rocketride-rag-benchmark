@@ -52,12 +52,24 @@ def table(header, rows):
 
 
 def verdict(what, by_arm_values):
-    """One sentence on whether a difference between the two systems is larger than the spread of their runs."""
+    """One sentence that describes the spread: do the runs of the two systems overlap. It describes, it does not
+    decide: the table of run pairs shows every pair."""
     over = ranges_overlap(by_arm_values.get('rr', []), by_arm_values.get('lg', []))
     if over is None:
         return None
-    return '%s: %s' % (what, 'the runs of the two systems overlap, so the difference is not conclusive' if over
-                       else 'the runs of the two systems do not overlap')
+    return '%s: %s' % (what, 'the lowest and highest runs of the two systems overlap' if over
+                       else 'the lowest and highest runs of the two systems do not overlap')
+
+
+def pairs(runs):
+    """[(n, RocketRide run n, LangGraph run n)] for every n both systems have a valid run of."""
+    by_label = {r['label']: r for r in runs}
+    numbers = sorted({int(label.split('-')[1]) for label in by_label if label.split('-')[-1].isdigit()})
+    return [(n, by_label['rr-%d' % n], by_label['lg-%d' % n]) for n in numbers if 'rr-%d' % n in by_label and 'lg-%d' % n in by_label]
+
+
+def share(a, b):
+    return 'n/a' if not a or not b else '%.0f %%' % (100 * a / b)
 
 
 def main():
@@ -95,6 +107,10 @@ def main():
                                          '`%s` %s' % (r['label'], (r.get('harness') or {}).get('commit')) for r in runs)))
                                     + (', with uncommitted changes in at least one run' if dirty else '')),
             '- **RocketRide task threads:** %d. Both systems run as shipped: nothing inside either is changed.' % plan['workers'],
+            '- **Memory limits:** the limit of the service under test covers all of RocketRide, parser included. On the '
+            'LangGraph side it covers the service; its parser runs in a container of its own without a limit.',
+            '- **Load clients:** RocketRide through its client SDK on one websocket; LangGraph over HTTP connections that '
+            'stay open, one per worker thread of the client.',
             '- **Timed runs, in the order taken:** %s.' % ', '.join('`%s`' % l for l in a['campaign']), '']
     if a['not_run'] or (a['status'].get('failed') or a['status'].get('skipped')):
         doc += ['**Not every run completed.** Not run: %s. Failed: %s. Skipped: %s.' % (
@@ -143,16 +159,36 @@ def main():
         rows.append([NAMES[arm], ' / '.join(num(r['docs_per_s'], 3) for r in rs), num(rate, 3),
                      spread([r['docs_per_s'] for r in rs], 3),
                      'n/a' if not base else '%.0f %%' % (100 * rate / base),
+                     # chunks that passed the read-back, per second
+                     num(mean([r.get('chunks_per_s') for r in rs]), 1),
                      num(mean([r['cpu_s_per_doc'] for r in rs])), num(mean([r.get('service_peak_own_memory_GiB') for r in rs])),
                      num(mean([r['p50_s'] for r in rs])), num(mean([r.get('db_ms_per_doc') for r in rs])),
                      ' / '.join(str(r.get('commits')) for r in rs),
                      num(highest([r.get('client_average_cpus') for r in rs]), 2)])
-    doc += [table(['System', 'PDFs per second, each run', 'Mean', 'Lowest to highest', 'Share of LangGraph', 'CPU-seconds per PDF',
+    doc += [table(['System', 'PDFs per second, each run', 'Mean', 'Lowest to highest', 'Share of LangGraph',
+                   'Verified chunks per second', 'CPU-seconds per PDF',
                    'Peak own memory, GiB', 'Time per PDF, middle value, s', 'Database time per PDF, ms', 'Commits',
                    'Client CPUs busy, highest run'], rows), '']
     said = verdict('PDFs per second', {arm: [r['docs_per_s'] for r in by_arm[arm]] for arm in NAMES})
     if said:
         doc += [said + '.', '']
+    paired = pairs(runs)
+    if paired:
+        # Every pair on its own: the n-th run of each system. A ratio that changes side from pair to pair is no result.
+        header = ['Pair', 'Ingestion']
+        for phase, title in PHASES.items():
+            if any(phase in (r.get('search') or {}) for r in runs):
+                header += ['Search %s, %d in flight' % ('without index' if phase == 'exact' else 'with index', n) for n in levels]
+        rows = []
+        for n, rr, lg in paired:
+            row = ['rr-%d / lg-%d' % (n, n), share(rr['docs_per_s'], lg['docs_per_s'])]
+            for phase in PHASES:
+                if any(phase in (r.get('search') or {}) for r in runs):
+                    ours, theirs = (rr.get('search') or {}).get(phase), (lg.get('search') or {}).get(phase)
+                    row += [share(ours['levels'][i]['questions_per_s'], theirs['levels'][i]['questions_per_s']) if ours and theirs else 'n/a'
+                            for i in range(len(levels))]
+            rows.append(row)
+        doc += ['**Every pair of runs: RocketRide\'s rate as a share of LangGraph\'s.**', '', table(header, rows), '']
     steps = by_arm['lg'][0].get('langgraph_step_ms_per_doc') if by_arm['lg'] else None
     if steps:
         doc += ['LangGraph, mean time per PDF and graph step (first run), ms: ' +
@@ -160,7 +196,7 @@ def main():
 
     client_busy = [('ingestion', r['label'], r['client_average_cpus']) for r in runs if (r.get('client_average_cpus') or 0) >= CLIENT_NEAR_LIMIT]
     client_measured = sum(1 for r in runs if r.get('client_average_cpus') is not None)
-    many_empty, empty_forms = [], []
+    many_empty, empty_forms, index_not_used, index_not_recorded = [], [], [], []
     for phase, title in PHASES.items():
         if not any(phase in (r.get('search') or {}) for r in runs):
             continue
@@ -200,6 +236,14 @@ def main():
             if phase == 'hnsw':
                 # Beside the rate: how much of the exact answer the index returns in the same run.
                 row.append(num(mean([100 * r['index_against_exact']['mean_overlap'] for r in picked if r.get('index_against_exact')]), 0))
+                # And whether Postgres used the index at all: index scans per timed search, from the database's counter.
+                used = [(r['label'], (r['search'][phase].get('index') or {})) for r in picked]
+                row.append(num(mean([i['index_scans_during_search'] / i['searches_timed'] for _, i in used
+                                     if i.get('searches_timed') and i.get('index_scans_during_search') is not None]), 2))
+                index_not_used += ['`%s`' % label for label, i in used if i.get('index_used') is False]
+                index_not_recorded += ['`%s`%s' % (label, ' (its database sessions were still inside a transaction, so their '
+                                                   'counts had not arrived)' if i.get('sessions_still_in_a_transaction') else '')
+                                       for label, i in used if i.get('index_used') is None]
             facts.append(row)
             for r in picked:
                 where = 'no index' if phase == 'exact' else 'with the index'
@@ -213,8 +257,29 @@ def main():
         header = ['System', 'Answers checked', 'Not valid', 'Valid, without a result', 'Time inside the database per search, ms',
                   'Service CPU per question at %d in flight, ms' % levels[0]]
         if phase == 'hnsw':
-            header.append('Results in common with the same run\'s search without the index, %')
+            header += ['Results in common with the same run\'s search without the index, %', 'Index scans per timed search']
         doc += [table(header, facts), '']
+        if phase == 'hnsw':
+            if index_not_used:
+                doc += ['**The index was present but Postgres did not use it in:** %s. Their rates in this section are '
+                        'rates of a search without an index.' % ', '.join(index_not_used), '']
+            elif index_not_recorded:
+                doc += ['Whether Postgres used the index could not be read from its counter for: %s. The plan below and '
+                        'the time inside the database per search are the other evidence.' % ', '.join(index_not_recorded), '']
+            else:
+                doc += ['Postgres used the index in every run of this section. The last column is its own count of index '
+                        'scans per timed search; the warm-up questions are counted in, so a value a little above 1 means '
+                        'every search went through the index.', '']
+            plans = [(r['label'], (r['search'][phase].get('plan') or {})) for r in runs if phase in (r.get('search') or {})]
+            shown = {}
+            for label, plan in plans:
+                if plan.get('plan'):
+                    shown.setdefault(label.split('-')[0], (label, plan))
+            for arm, (label, plan) in shown.items():
+                doc += ['Plan of the search statement %s sent most often (`%s`, taken after the timed questions). It is the '
+                        'plan for the statement with placeholders, which can differ from the plan of a search with its real '
+                        'values; the count of index scans above is what shows whether the index was used:' % (NAMES[arm], label),
+                        '', '```', plan['query'][:400], '', *plan['plan'][:12], '```', '']
         index = next((r['search'][phase]['index'] for r in runs if (r.get('search') or {}).get(phase, {}).get('index')), None)
         if index:
             doc += ['The index took %.0f s to build and is %.0f MB on %d rows (first run). It is approximate: the last column '
@@ -249,11 +314,13 @@ def main():
     timed = [r for r in stored if r.get('commit_times_checked')]
     unconfirmed = [(label, where, form) for label, where, form in empty_forms if not (form or {}).get('confirmed')]
     doc += ['- **Read-back of the stored rows:** %d of %d runs passed. A run passes when every expected chunk is in the '
-            'table exactly as often as expected, every stored vector equals the reference vector within tolerance, the '
-            'table holds no row that is not explained, and every document was committed before the client had its answer.' % (
+            'table under its own PDF and chunk number exactly as often as expected, every stored vector equals the '
+            'reference vector within tolerance, the table holds no row that is not explained, and every document was '
+            'committed before the client had its answer.' % (
                 sum(1 for r in stored if r['check_pass']), len(stored)),
             '- **Rows that are not expected chunks:** %s.' % ('n/a' if not stored else '; '.join(
-                '`%s` %d of the store itself, %d unexplained' % (r['label'], r.get('rows_of_the_store_itself') or 0, r.get('rows_unexplained') or 0)
+                '`%s` %d of the store itself, %d unexplained, %d with an expected text under another PDF or chunk number' % (
+                    r['label'], r.get('rows_of_the_store_itself') or 0, r.get('rows_unexplained') or 0, r.get('rows_misfiled') or 0)
                 for r in stored)),
             '- **Stored before the answer:** ' + (
                 'not checked: no run recorded the commit time of its rows.' if not timed else

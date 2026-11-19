@@ -32,6 +32,7 @@ has stopped.
 | Metric | What it tells you | How it is taken |
 |---|---|---|
 | PDFs per second | Speed of the whole ingestion path | Number of PDFs divided by the wall time from the first request sent to the last one answered ([driver.py](../harness/driver.py)) |
+| Verified chunks per second | The same, counted in the unit that is stored | The chunks the read-back found in the table as expected, divided by the same wall time |
 | Share of LangGraph | RocketRide's rate as a percentage of LangGraph's in the same campaign | From the means of the two systems' runs |
 | CPU-seconds per PDF | How much computing one PDF costs | CPU time of the service's containers during the timed requests, from the kernel's cgroup counters (`cpu.stat`), divided by the PDFs |
 | Average CPUs busy | How much of its CPUs the service used | The same CPU time divided by the wall time |
@@ -59,6 +60,8 @@ Reported for each state of the table (without an index, with the index) and each
 | Time inside the database per search | Database cost of one search, as the database sees it | Execution time of the search statement divided by its calls, from `pg_stat_statements` |
 | Index build time and size | Cost of the vector index | Timed and measured by the harness when it builds the index |
 | Results in common with the search without the index | What the index's speed costs in results | The same run's result lists with and without the index, compared question by question. The index is approximate, so the report prints this beside the rate with the index. |
+| Index scans per timed search | Whether Postgres used the index at all | The database's own counter of scans of the index (`pg_stat_user_indexes`), read before the phase's warm-up questions and after its timed questions, divided by the timed searches. A little above 1 means every search went through the index (the warm-up questions are counted in). 0 means the index was present and not used; the report marks such a run. A database session hands its counts in only when it leaves its transaction or disconnects: when the count is 0 and a session of the system is still inside a transaction, the report says "not determined" and does not say "not used". |
+| Plan of the search statement | How Postgres runs each system's own search | After the timed questions, the search statement the system sent most often is taken from `pg_stat_statements` as the database recorded it and given to `EXPLAIN (GENERIC_PLAN)`. It is printed in the report. It is the plan for the statement with placeholders and can differ from the plan of a search with real values, so the scan count above decides, not the plan. |
 | Client CPUs busy | Whether the load client set the rate | As for ingestion, for every level |
 
 ## Correctness
@@ -67,7 +70,11 @@ A rate only counts when the run did the right work. Four checks:
 
 **1. Screening, before any timed run.** Every candidate PDF goes through both systems without the store. A PDF
 is used only when both return a valid result, the chunk texts are identical and the vectors are equal within the
-tolerance of the read-back ([finalize.py](../harness/finalize.py)). Every PDF left out is listed with its reason,
+tolerance of the read-back ([finalize.py](../harness/finalize.py)). A response that reports an error, is not
+an object or has lists of another shape is not a result, and its PDF is left out. A PDF without text is a result
+of its own kind: LangGraph returns an empty list of chunks, RocketRide its normal answer without a list of
+documents. Such a PDF is kept only when both systems found no text in it; it stays in the timed runs, stores no
+rows, and the report says how many there are. Every PDF left out is listed with its reason,
 and the errors of each screening run are counted by message, so a failure in one system cannot pass unseen. A
 file with the same bytes as an earlier one is not a candidate at all.
 
@@ -78,7 +85,10 @@ candidates were left out and why.
 of every stored chunk text and returns every stored vector. They are compared with the reference, which is the
 RocketRide screening run. A run passes when:
 
-- every expected chunk is in the table,
+- every expected chunk is in the table under its own PDF and its own chunk number. A chunk is the three
+  together: the PDF, the number of the chunk inside it, and the text. A row with the right text under another PDF
+  or another number is counted as misfiled and fails the run. The number is the one the system itself gave the
+  chunk in its screening run, so each system is checked against its own numbering,
 - no expected chunk is in the table more often than expected,
 - every stored vector equals the reference vector of its chunk within tolerance (absolute 1e-5 plus relative 1e-4),
 - the table holds no other row. The one exception is a row RocketRide's store keeps for itself, which its own
@@ -86,7 +96,9 @@ RocketRide screening run. A run passes when:
 - no document has a row that was committed after the client had that document's answer, and no row was
   committed after the client's clock stopped (allowance 1 ms). The database keeps the commit time of every row
   (`track_commit_timestamp`), and the client records when it sent each document and how long the answer took.
-  So an answer came only after its document was stored, and the ingestion time is the time to store.
+  So an answer came only after its document was stored, and the ingestion time is the time to store. Every PDF
+  that has chunks must be covered by this comparison: if the rows or the answer time of one cannot be found, the
+  run fails.
 
 Both systems are checked against the same reference, so two passing runs stored the same chunks and vectors, and
 nothing else.
@@ -124,9 +136,11 @@ the campaign runs it again.
 ## Reading a difference
 
 - **Runs per system.** Three by default, in alternating order (`--repeats`). Use five for a result you publish.
-- **Spread.** The report prints every run, the mean, and the lowest and highest run of each system.
-- **Not conclusive.** When the runs of the two systems overlap, the report says so, and the difference should
-  not be reported as one.
+- **Spread.** The report prints every run, the mean, and the lowest and highest run of each system, and says
+  whether the two systems' ranges overlap. That sentence describes the spread. It does not decide anything.
+- **Pairs.** The n-th run of RocketRide and the n-th run of LangGraph are taken one after the other. The report
+  gives RocketRide's rate as a share of LangGraph's for every pair. A share that changes side from pair to pair
+  is not a difference to report.
 - **Everything, not a selection.** A report lists the candidates left out, the runs that failed and the attempts
   that were run again. Give all metrics of this page, whichever system leads.
 

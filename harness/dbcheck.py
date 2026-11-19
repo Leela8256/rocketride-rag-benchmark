@@ -8,14 +8,17 @@ The check. The database itself computes the SHA-256 of every stored chunk text a
 They are compared with the chunk texts and vectors of the same documents in the reference run, which is the
 RocketRide screening run of the campaign (per_doc.jsonl and vectors.f32 of that cell):
 
-  every expected chunk is in the table;
+  every expected chunk is in the table under its own PDF and its own chunk number. A chunk is the three together:
+  the PDF it belongs to, its number inside that PDF, and its text. A row with the right text under another PDF or
+  another number is not that chunk: it is counted as misfiled and fails the check;
   no expected chunk is in the table more often than expected;
   every stored vector equals the reference vector of its chunk within the tolerance the embedding runs use;
   the table holds no other row, except the one row RocketRide's store keeps for itself (the plan names it). The
   campaign removes the warm-up documents and LangGraph's start-up fixture before the timed requests, so any other
   row is unexplained and fails the check: a search could return it;
   no document has a row that was committed after the client had that document's answer, and no row was
-  committed after the client's clock stopped. The database keeps the commit time of every row
+  committed after the client's clock stopped. Every PDF that has chunks must be covered by that comparison: a PDF
+  whose rows or whose answer time cannot be found makes the check fail. The database keeps the commit time of every row
   (track_commit_timestamp) and the client records when it sent every document and how long the answer took. So
   an answer came only after its document was stored, and the timed window holds all of the storing.
 
@@ -94,46 +97,65 @@ def main():
     vectors = array.array('f')
     with (ref / 'vectors.f32').open('rb') as f:
         vectors.fromfile(f, (ref / 'vectors.f32').stat().st_size // vectors.itemsize)
-    expected, ref_vector, seen = collections.Counter(), {}, set()
+    # An expected chunk is (PDF, chunk number, hash of the text). Texts and vectors come from the reference run.
+    # The number is the one this system itself gave the chunk in its own screening run: the two systems need not
+    # number their chunks the same way, and a system is checked against its own numbering. The screening has
+    # already shown that both return the same texts in the same order, so position i is the same chunk in both.
+    # Without that file (or in one written before numbers were recorded) the position in the PDF is the number.
+    own_numbers, own_screening = {}, root / 'cells' / ('screen-%s' % arm) / 'per_doc.jsonl'
+    if own_screening.exists():
+        for line in own_screening.read_text().splitlines():
+            row = json.loads(line)
+            if row['doc'] in wanted and row.get('chunk_numbers') is not None:
+                own_numbers[row['doc']] = row['chunk_numbers']
+    expected, ref_vector, expected_texts, seen = collections.Counter(), {}, set(), set()
     for line in (ref / 'per_doc.jsonl').read_text().splitlines():
         row = json.loads(line)
         if row['doc'] not in wanted:
             continue
         seen.add(row['doc'])
+        numbers = own_numbers.get(row['doc'], row.get('chunk_numbers')) or list(range(len(row['text_sha256'])))
+        assert len(numbers) == len(row['text_sha256']), 'another number of chunk numbers than chunks: %s' % row['doc']
         for i, digest in enumerate(row['text_sha256']):
-            expected[digest] += 1
+            key = (row['doc'], numbers[i], digest)
+            expected[key] += 1
+            expected_texts.add(digest)
             start = (row['vector_offset'] + i) * DIM
-            ref_vector.setdefault(digest, vectors[start:start + DIM])
+            ref_vector.setdefault(key, vectors[start:start + DIM])
     assert seen == wanted, 'the reference run does not cover every document of this cell'
+    documents_with_chunks = {key[0] for key in expected}
 
     # Which rows are the store's own, and which document a row belongs to.
     own_id = plan['rr'].get('own_object_id') if arm == 'rr' else None
     own = 'objectid IS NOT DISTINCT FROM %s' % quoted(own_id) if own_id else 'false'
     document = "encode(convert_to(coalesce(%s, ''), 'UTF8'), 'hex')" % ('parent' if arm == 'rr' else "langchain_metadata->>'source'")
+    number = "coalesce(%s, '')" % ('chunkid::text' if arm == 'rr' else "langchain_metadata->>'chunk'")
     total = int(psql('SELECT count(*) FROM %s' % table))
     own_total = int(psql('SELECT count(*) FROM %s WHERE %s' % (table, own)))
-    dump = psql("COPY (SELECT encode(sha256(convert_to(content, 'UTF8')), 'hex'), (%s)::int, %s, embedding::text FROM %s "
-                "WHERE content IS NOT NULL AND embedding IS NOT NULL) TO STDOUT" % (own, document, table))
-    found, unexplained = collections.Counter(), collections.Counter()
+    dump = psql("COPY (SELECT encode(sha256(convert_to(content, 'UTF8')), 'hex'), (%s)::int, %s, %s, embedding::text FROM %s "
+                "WHERE content IS NOT NULL AND embedding IS NOT NULL) TO STDOUT" % (own, document, number, table))
+    found, unexplained, misfiled = collections.Counter(), collections.Counter(), collections.Counter()
     worst, outside, compared, own_dumped, dumped = 0.0, 0, 0, 0, 0
     for line in dump.split('\n'):
         if not line:
             continue
-        digest, is_own, name, text = line.split('\t', 3)
+        digest, is_own, name, chunk_number, text = line.split('\t', 4)
         name = unhex(name)
         dumped += 1
         if is_own == '1':
             own_dumped += 1
             continue
-        if digest not in expected:
-            unexplained[name or '(no document name)'] += 1
+        key = (name, int(chunk_number) if chunk_number.lstrip('-').isdigit() else None, digest)
+        if key not in expected:
+            # The text of an expected chunk under another PDF or another chunk number is not that chunk.
+            (misfiled if digest in expected_texts else unexplained)[name or '(no document name)'] += 1
             continue
-        found[digest] += 1
+        found[key] += 1
         values = [float(x) for x in text.strip('[]').split(',')]
         assert len(values) == DIM, 'a stored vector has %d values' % len(values)
         compared += 1
         bad = False
-        for a, b in zip(values, ref_vector[digest]):
+        for a, b in zip(values, ref_vector[key]):
             d = abs(a - b)
             if d > worst:
                 worst = d
@@ -147,6 +169,7 @@ def main():
     if bare:
         unexplained['(rows without a text or a vector)'] += bare
     rows_unexplained = sum(unexplained.values())
+    rows_misfiled = sum(misfiled.values())
 
     # Was every document stored before the client had its answer, and every row before the client's clock stopped?
     # The store's own row is left out: a store may touch it when its task ends.
@@ -169,9 +192,12 @@ def main():
             late = int(psql('SELECT count(*) FROM %s WHERE NOT (%s) AND pg_xact_commit_timestamp(xmin) > to_timestamp(%.6f)' % (
                 table, own, stop + LATE_S)))
         if answered:
-            compared_documents = sum(1 for name in commits if name in answered)
-            late_documents = sorted(name for name, last in commits.items() if name in answered and last > answered[name] + LATE_S)
-    commit_times_checked = late is not None and late_documents is not None
+            covered = [name for name in documents_with_chunks if name in commits and name in answered]
+            compared_documents = len(covered)
+            late_documents = sorted(name for name in covered if commits[name] > answered[name] + LATE_S)
+    # Checked means: for every PDF that has chunks, its rows were found under its name and compared with its answer.
+    commit_times_checked = (late is not None and late_documents is not None
+                            and compared_documents == len(documents_with_chunks))
     # How many times each expected chunk is stored, as a multiple of how often the documents contain it.
     copies = collections.Counter('%g' % (found[h] / expected[h]) for h in expected)
 
@@ -188,10 +214,14 @@ def main():
         'rows_of_the_store_itself': own_total,
         'rows_unexplained': rows_unexplained,
         'unexplained_rows_by_document': dict(unexplained.most_common(10)),
+        # Rows that hold the text of an expected chunk under another PDF or another chunk number.
+        'rows_with_an_expected_text_in_the_wrong_place': rows_misfiled,
+        'misfiled_rows_by_document': dict(misfiled.most_common(10)),
         # None when it could not be checked: the client recorded no times, or the database does not keep commit
         # times. A plan that starts the database with track_commit_timestamp=on requires the check.
         'commit_times_checked': commit_times_checked, 'commit_times_required': required,
         'rows_committed_after_the_clock_stopped': late,
+        'documents_with_chunks': len(documents_with_chunks),
         'documents_compared_with_their_answer': compared_documents,
         'documents_committed_after_their_answer': None if late_documents is None else len(late_documents),
         'first_documents_committed_after_their_answer': (late_documents or [])[:10],
@@ -221,12 +251,13 @@ def main():
         'sample_rows_without_text': sample.splitlines(),
         'reference': str(ref),
         'pass': (missing == 0 and outside == 0 and compared == sum(found.values()) and surplus == 0
-                 and rows_unexplained == 0 and own_total <= 1 and not late and not late_documents
+                 and rows_unexplained == 0 and rows_misfiled == 0 and own_total <= 1 and not late and not late_documents
                  and (commit_times_checked or not required)),
     }
     (out / 'db-check.json').write_text(json.dumps(result, indent=2) + '\n')
     print('DBCHECK', json.dumps({k: result[k] for k in ['table', 'expected_chunks', 'rows_total', 'rows_of_the_store_itself',
-                                                         'rows_unexplained', 'expected_chunks_missing',
+                                                         'rows_unexplained', 'rows_with_an_expected_text_in_the_wrong_place',
+                                                         'expected_chunks_missing',
                                                          'expected_chunks_stored_too_often', 'copies_of_each_expected_chunk',
                                                          'vectors_outside_tolerance', 'commit_times_checked',
                                                          'rows_committed_after_the_clock_stopped',

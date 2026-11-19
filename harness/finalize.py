@@ -68,7 +68,8 @@ def main():
         if name not in rr or name not in lg:
             why[name] = 'failed or timed out in %s' % ' and '.join(s for s, d in [('RocketRide', rr), ('LangGraph', lg)] if name not in d)
         elif not rr[name]['ok'] or not lg[name]['ok']:
-            why[name] = 'invalid result'
+            # An error or a response of another shape. It is never taken for a PDF without text.
+            why[name] = 'not a valid result in %s' % ' and '.join(s for s, d in [('RocketRide', rr), ('LangGraph', lg)] if not d[name]['ok'])
         elif rr[name]['text_sha256'] != lg[name]['text_sha256']:
             why[name] = 'the two systems returned different chunk texts'
         elif not same_vectors(vectors(lg[name], lg_vectors), vectors(rr[name], rr_vectors)):
@@ -91,6 +92,7 @@ def main():
                'duplicates_left_out_by_the_plan': len(manifest.get('duplicates_left_out', [])),
                'measured': len(measured),
                'chunks_of_measured': sum(rr[n]['chunks'] for n in measured),
+               # PDFs both systems read as holding no text. They are in the timed runs and store no rows.
                'documents_without_chunks': sum(1 for n in measured if not rr[n]['chunks']),
                'questions_available': len(pool), 'questions': len(picked),
                'screening_failures': {s: len(json.loads(p.read_text())) if p.exists() else 0

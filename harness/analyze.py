@@ -150,6 +150,8 @@ def ingestion(label, cfg):
         out.update(check_pass=check['pass'], expected_chunks=check['expected_chunks'], rows_total=check['rows_total'],
                    rows_other=check['rows_other'], rows_of_the_store_itself=check['rows_of_the_store_itself'],
                    rows_unexplained=check['rows_unexplained'],
+                   rows_misfiled=check.get('rows_with_an_expected_text_in_the_wrong_place'),
+                   http=result.get('http'),
                    rows_committed_after_the_clock_stopped=check['rows_committed_after_the_clock_stopped'],
                    commit_times_checked=check['commit_times_checked'],
                    documents_committed_after_their_answer=check['documents_committed_after_their_answer'],
@@ -184,6 +186,9 @@ def search(label, plan):
         out[phase] = {'levels': levels,
                       # RocketRide only: was the form of an answer without results confirmed against the engine
                       'empty_answer_form': read(path).get('empty_answer_form'),
+                      'http': read(path).get('http'),
+                      # the plan of the system's own search statement, taken after the timed questions
+                      'plan': read(cell / ('db-search-%s-plan.json' % phase)) if (cell / ('db-search-%s-plan.json' % phase)).exists() else None,
                       # LangGraph only: mean time per step and question at the first level
                       'langgraph_step_ms': server_timing(lines(cell / ('search-%s-outputs.jsonl' % phase))),
                       'db_search_statement': main['query'][:160] if main else None,

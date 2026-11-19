@@ -25,10 +25,11 @@ import os
 import sys
 import time
 import traceback
-import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import lg_http
 
 ROOT = Path('/campaign')
 PIPELINES = Path('/pipelines')      # rocketride/pipelines of this repository
@@ -122,13 +123,12 @@ def lg_request(port, pipeline, rid, question, k):
     options = json.dumps({'question': question, 'k': k})
     payload = ''.join('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, name, value)
                       for name, value in [('request_id', rid), ('options', options)]) + '--%s--\r\n' % boundary
-    request = urllib.request.Request('http://127.0.0.1:%d/v1/process/%s' % (port, pipeline), data=payload.encode(),
-                                     headers={'Content-Type': 'multipart/form-data; boundary=' + boundary})
-    with urllib.request.urlopen(request, timeout=600) as response:
-        raw = response.read()
-        ok = response.headers.get('X-Request-ID') == rid and response.headers.get('X-Output-SHA256') == hashlib.sha256(raw).hexdigest()
-        timing = response.headers.get('Server-Timing')
-    return json.loads(raw), ok, timing
+    status, response, raw = lg_http.post(port, '/v1/process/' + pipeline, payload.encode(),
+                                         'multipart/form-data; boundary=' + boundary, 600)
+    if status != 200:
+        raise RuntimeError('the service answered %d: %s' % (status, raw[:300].decode('utf-8', 'replace')))
+    ok = response.getheader('X-Request-ID') == rid and response.getheader('X-Output-SHA256') == hashlib.sha256(raw).hexdigest()
+    return json.loads(raw), ok, response.getheader('Server-Timing')
 
 
 def lg_answer(result, identity_ok):
@@ -275,7 +275,8 @@ async def main(label, phase):
             })
             print('LEVEL', json.dumps({x: levels[-1][x] for x in ['in_flight', 'questions_per_s', 'wall_s', 'answers_not_valid']}), flush=True)
         save(out / ('search-%s.json' % phase), {'label': label, 'arm': arm, 'phase': phase, 'k': k,
-                                                'questions': len(queries), 'empty_answer_form': empty_form, 'levels': levels})
+                                                'questions': len(queries), 'empty_answer_form': empty_form,
+                                                'http': dict(lg_http.STATS) if arm == 'lg' else None, 'levels': levels})
         assert all(l['questions'] == len(queries) for l in levels), 'a question is missing from the results'
         bad = sum(l['answers_not_valid'] for l in levels)
         assert not bad, '%d responses were not answers; see search-%s-answers-to-inspect.json' % (bad, phase)

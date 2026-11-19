@@ -115,13 +115,14 @@ Other machines need their own CPU lists: see `python3 harness/make_plan.py --hel
 python3 tests/test_plan_dry_run.py            # plan, docker commands, pipeline files
 python3 tests/test_search_validation.py       # the check of every search answer, with a stand-in for the client SDK
 python3 tests/test_finalize.py                # which PDFs the screening keeps, and why it leaves the others out
+python3 tests/test_http_client.py             # the kept-alive HTTP client of the LangGraph side
 python3 tests/test_store_and_dbcheck.py       # needs a scratch Postgres with pgvector, see the file
 ```
 
 ## Status
 
 - The harness was developed on RocketRide engine 3.5.0. The analysis and report scripts were checked against
-  the run files of a 3,000-PDF campaign from that work, and the four tests above pass.
+  the run files of a 3,000-PDF campaign from that work, and the five tests above pass.
 - The default engine release here is 3.6.0. `infra/build_images.sh` has been run against it on a 32-CPU Linux
   machine: every image built, the engine ran the ingestion pipeline in the warm-up step with client SDK 1.6.0,
   and the parser helper compiled against the release's jars. The images have not been built again since two
@@ -129,17 +130,22 @@ python3 tests/test_store_and_dbcheck.py       # needs a scratch Postgres with pg
   settings its service read and never applied.
 - The campaign itself (screening, timed runs, search) has **not** been run on 3.6.0 in this form yet. Run the
   smoke plan first and expect to adjust small things.
-- Three things were added after a review and are covered by the tests only, not yet by a run against the engine:
-  the check of every search answer, the removal of the warm-up rows before the timed requests, and the comparison
-  of every document's commit time with the moment the client had its answer. They depend on three facts about the
-  engine that the smoke run shows:
+- Several checks were added after reviews and are covered by the tests only, not yet by a run against the engine:
+  the check of every search answer and of every screening result, the removal of the warm-up rows before the
+  timed requests, the read-back by PDF, chunk number and text, the comparison of every document's commit time with
+  the moment the client had its answer, and the record of whether Postgres used the vector index. They depend on
+  four facts about the engine that the smoke run shows:
   - a RocketRide answer without results has the form the search client expects. The client asks for one before
     the first timed question; a form it cannot read stops the run, and the report says whether the form was
     confirmed;
   - RocketRide's store writes a document's file name into the `parent` column. The warm-up rows are removed and
     the commit times are matched by it; if it does not hold, the run stops before the timed requests and names
     the rows;
-  - the store's own row has the id `schema`. If it does not, the same stop applies.
+  - the store's own row has the id `schema`. If it does not, the same stop applies;
+  - RocketRide gives a chunk the same number in its answer (`metadata.chunkId`) and in the `chunkId` column of
+    its table. The read-back compares the two; if they differ, it fails and lists the rows as misfiled.
+- Rates taken before the LangGraph client kept its connections open (among them the 3,000-PDF campaign the
+  scripts were checked against) do not compare with rates taken with the current client.
 - No measured results are published in this repository.
 
 ## Limits to keep in mind
@@ -156,9 +162,15 @@ python3 tests/test_store_and_dbcheck.py       # needs a scratch Postgres with pg
 - **Screened PDFs only.** The timed runs use the PDFs that both systems turn into the same chunks and vectors.
   A PDF one system fails on, or reads differently, is left out and listed in the report. The rates say nothing
   about such PDFs.
-- **Two different clients.** RocketRide is driven through its client SDK on one websocket, LangGraph through
-  plain HTTP requests. The clients are part of each stack as measured. The report shows the CPU use of the client
-  in every timed part.
+- **Two different clients.** RocketRide is driven through its client SDK on one websocket, LangGraph over HTTP
+  connections that stay open, one per worker thread of the client. The clients are part of each stack as
+  measured. The report shows the CPU use of the client in every timed part.
+- **Memory limits differ in what they cover.** The limit of the service under test covers all of RocketRide,
+  parser included. On the LangGraph side it covers the service, and the parser runs in its own container without
+  a limit. In the runs so far neither system came near the limit; the report prints the peak.
+- **An index that exists is not an index that is used.** The search phase "with a vector index" records how often
+  Postgres scanned the index. A run in which it did not is marked in the report, and its rates are those of a
+  search without an index.
 - **No cause is shown.** The benchmark compares two stacks. Saying which part of a stack makes it faster or
   slower (its scheduler, its store code, its transport) needs an experiment that changes that one part.
 - **Sittings do not compare.** Rates from two sittings on the same machine can differ by more than the effect

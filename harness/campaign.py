@@ -205,13 +205,58 @@ def db_statements(cfg):
     return [dict(zip(['calls', 'ms', 'rows', 'query'], line.split('\t', 3))) for line in raw.splitlines()]
 
 
+def index_scans(cfg, sql=None, at_least=None, wait_s=15):
+    """How often Postgres has scanned the vector index the harness built, from the database's own counter.
+
+    A database connection hands its numbers in when it has been idle for some seconds, so after a search phase the
+    counter is read until it has reached `at_least` or `wait_s` seconds have passed.
+    """
+    sql = sql or (lambda text: db_sql(cfg, text))
+    query = "SELECT coalesce(sum(idx_scan), 0) FROM pg_stat_user_indexes WHERE indexrelname = '%s_hnsw'" % table_of(cfg)
+    end = time.monotonic() + wait_s
+    while True:
+        scans = int(sql(query) or 0)
+        if at_least is None or scans >= at_least or time.monotonic() > end:
+            return scans
+        time.sleep(1)
+
+
+def index_use(scans, open_transactions):
+    """True: Postgres scanned the index. False: it did not. None: not determined, because a database session of the
+    system under test was still inside a transaction, and a session hands its scan counts in only when it leaves
+    its transaction or disconnects."""
+    return True if scans > 0 else None if open_transactions else False
+
+
+def search_plan(cfg, sql=None):
+    """The plan Postgres makes for the search statement the system under test sent most often. Taken after the timed
+    questions, from the statement as the database recorded it, so it is the system's own statement and not a copy."""
+    sql = sql or (lambda text: db_sql(cfg, text))
+    try:
+        # The search statement: a SELECT that uses one of pgvector's distance operators. Of several, the one called
+        # most often, and of those the one the database spent most time on.
+        query = sql("SELECT s.query FROM pg_stat_statements s JOIN pg_database d ON d.oid = s.dbid "
+                    "WHERE d.datname = current_database() AND s.query ILIKE 'select%' AND s.query ~ '<=>|<->|<#>' "
+                    "AND s.query NOT ILIKE '%pg_stat%' ORDER BY s.calls DESC, s.total_exec_time DESC LIMIT 1")
+    except subprocess.CalledProcessError:
+        query = None
+    if not query:
+        return {'query': None, 'plan': None, 'note': 'the database recorded no search statement'}
+    try:
+        plan = sql('EXPLAIN (GENERIC_PLAN) ' + query.strip().rstrip(';'))
+    except subprocess.CalledProcessError as e:
+        return {'query': query[:800], 'plan': None, 'note': 'no plan: ' + ' '.join((e.stderr or str(e)).split())[-300:]}
+    return {'query': query[:800], 'plan': plan.splitlines(), 'names_the_vector_index': '%s_hnsw' % table_of(cfg) in plan}
+
+
 def search_phases(cfg, out, client_cmd):
     """The search side, on the table the cell's ingestion filled.
 
     exact   the table as the system under test left it: neither creates a vector index, so every question is an
             exact scan of all stored vectors
     hnsw    the same table after a vector search index (pgvector HNSW, its defaults) has been built on it. The
-            index is built by this harness. It is not part of either system.
+            index is built by this harness. It is not part of either system. An index that exists is not an index
+            that is used: the number of index scans during the phase is read from the database and recorded.
     """
     table = table_of(cfg)
     for phase in PLAN['search']['phases']:
@@ -223,6 +268,7 @@ def search_phases(cfg, out, client_cmd):
                                         'index_bytes': int(db_sql(cfg, "SELECT pg_relation_size('%s_hnsw')" % table)),
                                         'rows': int(db_sql(cfg, 'SELECT count(*) FROM %s' % table))})
         db_sql(cfg, 'SELECT pg_stat_statements_reset()')
+        scans_before = index_scans(cfg) if phase == 'hnsw' else None
         cmd = client_cmd[:-2] + ['/harness/search_driver.py', cfg['label'], phase]
         with (out / ('search-%s.log' % phase)).open('w') as log:
             done = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, timeout=3600)
@@ -230,6 +276,16 @@ def search_phases(cfg, out, client_cmd):
         assert done.returncode == 0 and finished.exists() and json.loads(finished.read_text())['ok'], \
             'the search run failed; see search-%s.log' % phase
         save(out / ('db-search-%s.json' % phase), db_statements(cfg))
+        # After the timed questions: the plan of the system's own search statement, and how often the index was scanned.
+        save(out / ('db-search-%s-plan.json' % phase), search_plan(cfg))
+        if phase == 'hnsw':
+            searches = sum(l['questions'] for l in json.loads((out / 'search-hnsw.json').read_text())['levels'])
+            scans = index_scans(cfg, at_least=scans_before + searches) - scans_before
+            waiting = int(db_sql(cfg, "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                                      "AND pid <> pg_backend_pid() AND state LIKE 'idle in transaction%'"))
+            save(out / 'db-hnsw.json', dict(json.loads((out / 'db-hnsw.json').read_text()), searches_timed=searches,
+                                            index_scans_during_search=scans, sessions_still_in_a_transaction=waiting,
+                                            index_used=index_use(scans, waiting)))
 
 
 def service_commands(cfg):
