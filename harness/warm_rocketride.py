@@ -2,10 +2,12 @@
 of the nodes the benchmark uses and downloads the embedding model. Used once, while the images are built
 (infra/build_images.sh); the container is then saved as the image every run starts from.
 
-Runs in the client container. Usage: warm_rocketride.py <port> <pdf file>
+Runs in the client container, or with the client's Python and RAGBENCH_PIPELINES set to rocketride/pipelines
+(infra/stage_processes.sh). Usage: warm_rocketride.py <port> <pdf file>
 """
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -16,7 +18,7 @@ async def main(port, pdf):
     await client.connect()
     token = None
     try:
-        pipe = json.loads(Path('/pipelines/ingest_no_store.pipe').read_text())
+        pipe = json.loads((Path(os.environ.get('RAGBENCH_PIPELINES', '/pipelines')) / 'ingest_no_store.pipe').read_text())
         token = (await client.use(pipeline=pipe, threads=4))['token']
         body = Path(pdf).read_bytes()
         target = await client.pipe(token, objinfo={'name': Path(pdf).name, 'size': len(body)}, mime_type='application/pdf')

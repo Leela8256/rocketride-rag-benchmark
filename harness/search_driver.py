@@ -31,8 +31,10 @@ from pathlib import Path
 
 import lg_http
 
-ROOT = Path('/campaign')
-PIPELINES = Path('/pipelines')      # rocketride/pipelines of this repository
+# The paths of the client container. The process backend (no containers) gives its own through the environment.
+ROOT = Path(os.environ.get('RAGBENCH_CAMPAIGN', '/campaign'))
+PIPELINES = Path(os.environ.get('RAGBENCH_PIPELINES', '/pipelines'))      # rocketride/pipelines of this repository
+SERVICES = os.environ.get('RAGBENCH_SERVICES')     # process backend: the cell's services.json (root pids)
 NO_SUCH_DOCUMENT = 'ragbench-no-such-document'      # a document id no table holds
 KEEP = 5                                            # responses kept for inspection, per kind
 
@@ -51,6 +53,10 @@ def percentile(values, p):
 
 
 def counters():
+    if SERVICES:
+        import procs
+        now = procs.counters(SERVICES)
+        return {'epoch': now['epoch'], 'cpu_s': now['cpu_s']}
     groups = {}
     for p in sorted(Path('/groups').iterdir()):
         stat = dict(line.split() for line in (p / 'cpu.stat').read_text().splitlines())

@@ -93,6 +93,7 @@ def main():
         NAMES[system] = 'RocketRide, %d embedding calls at once (lock replaced, not as shipped)' % gate
     by_arm = {system: [r for r in runs if r['system'] == system] for system in order}
     plan = a['plan']
+    process = plan.get('backend') == 'process'
     levels = plan['search']['levels']
     host, harness = a.get('host') or {}, a.get('harness') or {}
     doc = ['# RAG benchmark: RocketRide and LangGraph, ingestion and search', '',
@@ -116,10 +117,22 @@ def main():
                 plan['search']['queries'], plan['search']['k'], ', '.join(str(x) for x in levels)),
             '- **Service under test:** CPUs `%s`, memory %s. **Database:** `%s` on CPUs `%s`, memory %s. **Client:** CPUs `%s`.' % (
                 plan['service_cpus'], plan['service_memory'], a['db']['image'], a['db']['cpus'], a['db']['memory'], plan['client_cpus']),
-            '- **Machine:** %s.' % ('not recorded' if not host else 'CPU %s; logical CPUs %s; physical cores %s; memory %s; kernel %s; Docker %s' % (
+            '- **Machine:** %s.' % ('not recorded' if not host else 'CPU %s; logical CPUs %s; physical cores %s; memory %s; kernel %s; %s' % (
                 ' / '.join(host.get('cpu_model') or ['not recorded']), known(host.get('logical_cpus')),
                 known(host.get('physical_cores')), known(host.get('memory_GiB'), ' GiB'), known(host.get('kernel')),
-                known(host.get('docker')))),
+                'Docker %s' % known(host.get('docker')) if not process else 'no containers' + (
+                    '' if not host.get('gpu') else '; GPU %s' % ' / '.join(
+                        '%s, %.0f GiB' % (g['name'], float(g['memory_total_mib']) / 1024) for g in host['gpu'])))),
+            *(['- **No containers:** every service is a plain process pinned to its CPUs with `taskset`. CPU time and memory '
+               'are read from `/proc` for each service\'s process tree, not from container counters, and no service has a '
+               'memory limit. The database is a Postgres started from unpacked packages.'] if process else []),
+            *(['- **Embedding device:** the GPU, for both systems. RocketRide is started without a model server and puts '
+               'the model on the GPU by itself; the LangGraph service is told through `EMBED_DEVICE=cuda`, the one value '
+               'added on its side. A run stops before its timed requests when the service under test holds no GPU memory '
+               'or LangGraph reports another device.' + (
+                   '' if not (plan.get('gpu') or {}).get('abort_above_mib') else ' A run is also stopped when the memory in use '
+                   'on the GPU, all its users together, passes %.0f GiB.' % (plan['gpu']['abort_above_mib'] / 1024))]
+              if plan.get('device') == 'cuda' else []),
             '- **Harness:** %s.' % ('commit not recorded' if not commits else
                                     ('commit `%s`' % commits[0] if len(commits) == 1 else
                                      '**the runs were taken with %d different commits**: %s' % (len(commits), ', '.join(
@@ -132,8 +145,9 @@ def main():
                 'the embedding model lets that many calls in at once (file `%s`). Everything else is the same image, the '
                 'same pipelines and the same settings.' % (
                     ' and '.join(str(g) for g, _ in gated), ((plan.get('gate') or {}).get('loader') or 'not recorded'))),
-            '- **Memory limits:** the limit of the service under test covers all of RocketRide, parser included. On the '
-            'LangGraph side it covers the service; its parser runs in a container of its own without a limit.',
+            *([] if process else [
+                '- **Memory limits:** the limit of the service under test covers all of RocketRide, parser included. On the '
+                'LangGraph side it covers the service; its parser runs in a container of its own without a limit.']),
             '- **Load clients:** RocketRide through its client SDK on one websocket; LangGraph over HTTP connections that '
             'stay open, one per worker thread of the client.',
             '- **Timed runs, in the order taken:** %s.' % ', '.join('`%s`' % l for l in a['campaign']), '']
@@ -311,6 +325,48 @@ def main():
             doc += ['The index took %.0f s to build and is %.0f MB on %d rows (first run). It is approximate: the last column '
                     'above says how much of the exact answer it returns, and a rate with the index has to be read with it.' % (
                         index['build_s'], index['index_bytes'] / 1e6, index['rows']), '']
+
+    if any(r.get('gpu') for r in runs):
+        doc += ['## GPU', '',
+                'The card during each timed part, from `nvidia-smi` samples every half second. "Busy" is the share of time '
+                'the card was computing, all its users together. "Memory of the service" is what the processes of the '
+                'service under test held on the card.', '']
+        rows = []
+        for r in runs:
+            parts = [('ingestion', r.get('gpu'))]
+            for phase in PHASES:
+                for l in ((r.get('search') or {}).get(phase) or {}).get('levels', []):
+                    parts.append(('search %s, %d in flight' % ('without index' if phase == 'exact' else 'with index', l['in_flight']), l.get('gpu')))
+            for what, g in parts:
+                if g:
+                    rows.append([r['label'], what, num(g['busy_mean_percent']), num(g['busy_p50_percent'], 0), num(g['busy_p95_percent'], 0),
+                                 num(g['service_memory_peak_GiB'], 2), num(g['memory_all_users_peak_GiB']),
+                                 num(g['power_mean_w'], 0), num(g['power_max_w'], 0), num(g['energy_Wh'])])
+        doc += [table(['Run', 'Part', 'Busy, mean, %', 'Busy, middle value, %', 'Busy, 95th percentile, %',
+                       'Memory of the service, peak, GiB', 'Memory of all users, peak, GiB', 'Power, mean, W', 'Power, highest, W',
+                       'Energy, Wh'], rows), '']
+        shared = [(r['label'], r['gpu']['other_tenant_memory_peak_GiB'], r.get('other_tenant_cpu_s')) for r in runs
+                  if (r.get('gpu') or {}).get('other_tenant_memory_peak_GiB')]
+        if shared:
+            doc += ['The card is shared. Another tenant\'s container held memory on it during the runs: ' + '; '.join(
+                '`%s` %.1f GiB, and it used %s CPU-seconds during the timed ingestion' % (label, mem, num(cpu)) for label, mem, cpu in shared) +
+                '. No timed part started while a process other than the service under test was working the card.', '']
+        devices = ['`%s` %s' % (r['label'], 'model on `%s`' % r['model_device'] if r.get('model_device') else
+                                '%s MiB held on the card after the warm-up' % (r.get('gpu_memory_after_warm_up') or {}).get('service_under_test_mib'))
+                   for r in runs]
+        doc += ['Where the model was: ' + '; '.join(devices) + '.', '']
+
+    connected = [r for r in runs if r.get('db_connections')]
+    if connected:
+        doc += ['## Database connections during ingestion', '',
+                'Twice a second the campaign read from Postgres what the system\'s connections were doing '
+                '(`pg_stat_activity`). A share is a share of all connections seen in all readings.', '']
+        states = sorted({k for r in connected for k in r['db_connections']['share_by_state']})
+        rows = [[r['label'], r['db_connections']['readings'], r['db_connections']['most_connections_in_a_reading'],
+                 num(r['db_connections']['mean_connections'], 2), num(r['db_connections']['mean_connections_running_a_statement'], 2)] +
+                ['%.0f %%' % (100 * r['db_connections']['share_by_state'].get(k, 0)) for k in states] for r in connected]
+        doc += [table(['Run', 'Readings', 'Most connections in a reading', 'Connections, mean', 'Running a statement, mean'] +
+                      ['State `%s`' % k for k in states], rows), '']
 
     if any(r.get('agreement') or r.get('index_against_exact') for r in runs):
         doc += ['## Do the two systems return the same results', '',

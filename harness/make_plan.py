@@ -89,6 +89,16 @@ def main():
     p.add_argument('--gate-dir', help='folder with bench_gate.py, the changed loader and gate-files.json')
     p.add_argument('--screen-request-timeout', type=int, default=900, help='seconds one PDF may take in a screening run')
     p.add_argument('--cell-hours', type=float, default=3.0, help='time limit of the ingestion of one run')
+    p.add_argument('--backend', choices=['docker', 'process'], default='docker',
+                   help='process: plain processes pinned with taskset in place of containers, for a machine where '
+                        'containers cannot be used (needs --process-config)')
+    p.add_argument('--process-config', help='JSON with the paths of the process backend: rr_dist, release_files, lg_python, '
+                                            'lg_app, lg_env, parser_classes, client_python, pg_bin, pg_lib, db_description '
+                                            'and optionally rr_ld_library_path')
+    p.add_argument('--device', choices=['cpu', 'cuda'], default='cpu',
+                   help='where both systems run the embedding model (cuda needs --backend process)')
+    p.add_argument('--gpu-abort-above-mib', type=int,
+                   help='stop a run when the memory in use on the GPU, all its users together, passes this')
     args = p.parse_args()
 
     if args.smoke:
@@ -101,6 +111,17 @@ def main():
     assert all(g >= 1 for g in gates) and len(set(gates)) == len(gates), 'gate sizes are different positive numbers'
     assert not gates or args.gate_dir, '--rr-gates needs --gate-dir'
     assert not (args.manifest and args.smoke), 'a fixed list is used as it is; --smoke picks its own 44 PDFs'
+    assert args.device == 'cpu' or args.backend == 'process', 'the container images embed on CPU; --device cuda needs --backend process'
+    assert args.backend == 'docker' or args.process_config, '--backend process needs --process-config'
+    assert args.backend == 'docker' or not gates, 'a run with a replaced lock is not available with the process backend'
+    process = None
+    if args.backend == 'process':
+        process = json.loads(Path(args.process_config).read_text())
+        needed = ['rr_dist', 'release_files', 'lg_python', 'lg_app', 'lg_env', 'parser_classes', 'client_python', 'pg_bin',
+                  'pg_lib', 'db_description']
+        assert all(k in process for k in needed), 'the process config needs: %s' % ', '.join(needed)
+        for key in ['rr_dist', 'release_files', 'lg_python', 'lg_app', 'parser_classes', 'client_python', 'pg_bin', 'pg_lib']:
+            assert Path(process[key]).exists(), 'not found: %s (%s)' % (process[key], key)
 
     corpus = Path(args.corpus).resolve()
     out = Path(args.out).resolve()
@@ -198,8 +219,19 @@ def main():
         (out / 'source/questions-given.jsonl').write_text(''.join(json.dumps(q) + '\n' for q in given_questions))
         args.questions = len(given_questions)
 
+    if process:
+        # Everything a run writes while it runs: the database's files, its socket and the services' temporary files.
+        process.update(run_dir=str(out / 'run'), socket_dir=str(out / 'run/sock'))
+        args.service_memory = args.db_memory = 'no limit'
+        args.db_image = process['db_description']
     plan = {
         'tag': out.name, 'root': str(out), 'repo': str(REPO), 'harness': harness_revision(), 'corpus': str(corpus),
+        # docker: every service in a container. process: plain processes pinned with taskset, counters from /proc.
+        'backend': args.backend, 'process': process,
+        # Where both systems run the embedding model. RocketRide chooses the GPU itself when one is there; the
+        # LangGraph service is told through EMBED_DEVICE. A run stops if a system's model is not on this device.
+        'device': args.device,
+        'gpu': None if args.device != 'cuda' else {'abort_above_mib': args.gpu_abort_above_mib},
         'documents': args.documents, 'candidates': candidates, 'questions': args.questions,
         # A fixed list: the timed runs ingest every PDF of it that passes the screening, however many those are.
         'measure_all_kept': bool(given), 'manifest_given': Path(args.manifest).name if given else None,

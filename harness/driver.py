@@ -25,9 +25,11 @@ from pathlib import Path
 
 import lg_http
 
-ROOT = Path('/campaign')
-CORPUS = Path('/corpus')
-PIPELINES = Path('/pipelines')      # rocketride/pipelines of this repository
+# The paths of the client container. The process backend (no containers) gives its own through the environment.
+ROOT = Path(os.environ.get('RAGBENCH_CAMPAIGN', '/campaign'))
+CORPUS = Path(os.environ.get('RAGBENCH_CORPUS', '/corpus'))
+PIPELINES = Path(os.environ.get('RAGBENCH_PIPELINES', '/pipelines'))      # rocketride/pipelines of this repository
+SERVICES = os.environ.get('RAGBENCH_SERVICES')     # process backend: the cell's services.json (root pids)
 DIM = 384
 QUERIES = None          # a screening run collects questions here
 
@@ -106,6 +108,9 @@ def percentile(values, p):
 
 
 def counters():
+    if SERVICES:
+        import procs
+        return procs.counters(SERVICES)
     groups = {}
     for p in sorted(Path('/groups').iterdir()):
         stat = dict(line.split() for line in (p / 'cpu.stat').read_text().splitlines())

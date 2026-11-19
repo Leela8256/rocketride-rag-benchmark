@@ -1,7 +1,11 @@
 """Embedding. Pure computation - no fastapi, no langgraph imports.
 
-PINNED: sentence-transformers/multi-qa-MiniLM-L6-cos-v1, CPU, 384-dim,
+PINNED: sentence-transformers/multi-qa-MiniLM-L6-cos-v1, 384-dim,
 normalize_embeddings=True, float32 -> Python float.
+
+The device is "cpu" unless EMBED_DEVICE names another one (for example
+"cuda" on a machine with a GPU). Nothing else about the model call changes
+with the device.
 
 The RocketRide engine resolves its `miniLM` profile to this exact model id
 and returns L2-normalized 384-dim vectors, so both systems embed with the
@@ -16,7 +20,7 @@ import threading
 from typing import List
 
 MODEL_ID = "sentence-transformers/multi-qa-MiniLM-L6-cos-v1"
-DEVICE = "cpu"
+DEVICE = os.environ.get("EMBED_DEVICE", "cpu")
 EMBED_DIM = 384
 NORMALIZE = True
 

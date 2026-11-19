@@ -134,6 +134,62 @@ def gate_use(cell, limit, start, end):
             'hold_ms': {'mean': sum(holds) / n, 'p50': percentile(holds, .5), 'p95': percentile(holds, .95)}}
 
 
+def gpu_use(cell, start, end):
+    """The GPU between two instants, from the samples nvidia-smi wrote during the run (process backend with a GPU).
+
+    busy: the share of time the card was computing, as nvidia-smi reports it, all users of the card together.
+    service memory: the memory held by every process on the card that is not the other tenant's. Only the service
+    under test runs on the card besides that tenant.
+    """
+    rows = [r for r in lines(cell / 'gpu.jsonl') if start <= r['epoch'] <= end]
+    if not rows:
+        return None
+    spec = read(cell / 'services.json') if (cell / 'services.json').exists() else {}
+    tenant = spec.get('other_tenant_pid')
+    ours, other = collections.Counter(), collections.Counter()
+    for r in lines(cell / 'gpu-procs.jsonl'):
+        if start <= r['epoch'] <= end:
+            (other if r['pid'] == tenant else ours)[r['epoch']] += r['mib']
+    busy, power = [r['util'] for r in rows], [r['power_w'] for r in rows]
+    return {'samples': len(rows), 'busy_mean_percent': sum(busy) / len(busy), 'busy_p50_percent': percentile(busy, .5),
+            'busy_p95_percent': percentile(busy, .95), 'busy_max_percent': max(busy),
+            'memory_all_users_peak_GiB': max(r['mem_used_mib'] for r in rows) / 1024,
+            'service_memory_peak_GiB': max(ours.values()) / 1024 if ours else None,
+            'other_tenant_memory_peak_GiB': max(other.values()) / 1024 if other else None,
+            'power_mean_w': sum(power) / len(power), 'power_max_w': max(power),
+            'energy_Wh': sum(power) / len(power) * (end - start) / 3600}
+
+
+def db_connections(cell, start, end):
+    """What the system's database connections were doing between two instants (process backend): the campaign reads
+    pg_stat_activity twice a second. One line per reading and state: epoch, state, wait type, wait event, connections.
+
+    A share is a share of connection-readings: of all connections seen in all readings, how many were in the state.
+    """
+    path = cell / 'db-activity.tsv'
+    if not path.exists():
+        return None
+    by_state, per_reading, active = collections.Counter(), collections.Counter(), collections.Counter()
+    for line in path.read_text().splitlines():
+        f = line.split('\t')
+        try:
+            epoch, state, n = float(f[0]), f[1], int(f[4])
+        except (ValueError, IndexError):
+            continue
+        if start <= epoch <= end:
+            by_state[state] += n
+            per_reading[epoch] += n
+            if state == 'active':
+                active[epoch] += n
+    total = sum(by_state.values())
+    if not total:
+        return None
+    return {'readings': len(per_reading), 'most_connections_in_a_reading': max(per_reading.values()),
+            'mean_connections': total / len(per_reading),
+            'mean_connections_running_a_statement': sum(active.values()) / len(per_reading),
+            'share_by_state': {k: v / total for k, v in sorted(by_state.items())}}
+
+
 def ingestion(label, cfg):
     cell = D / 'cells' / label
     out = {'label': label, 'arm': cfg['arm'], 'system': cfg.get('system', cfg['arm']), 'gate': cfg.get('gate'),
@@ -160,6 +216,17 @@ def ingestion(label, cfg):
                p50_s=result['latency_s']['p50'], p95_s=result['latency_s']['p95'], start_epoch=start)
     window = [s for s in lines(cell / 'samples.jsonl') if start <= s['epoch'] <= end]
     services = sorted({n for s in window for n in s['services'] if n != db_name(label)})
+    runtime = read(cell / 'runtime.json') if (cell / 'runtime.json').exists() else {}
+    out.update(gpu=gpu_use(cell, start, end), db_connections=db_connections(cell, start, end),
+               cpu_by_service_s=result.get('cpu_by_service_s'),
+               # LangGraph reports its model's device; for RocketRide the GPU memory it held after the warm-up is the evidence.
+               model_device=runtime.get('model_device'), gpu_memory_after_warm_up=runtime.get('gpu_memory_after_warm_up'),
+               engine_version=((runtime.get('version') or {}).get('data') or {}).get('version'),
+               versions=runtime.get('versions'))
+    tenant = [s['other_tenant_cpu_s'] for s in window if s.get('other_tenant_cpu_s') is not None]
+    if len(tenant) > 1:
+        # CPU time another tenant's container used while this run was timed: was the machine otherwise idle?
+        out['other_tenant_cpu_s'] = tenant[-1] - tenant[0]
     if window:
         # memory_current counts the file cache too; anon_bytes is the memory the processes hold themselves.
         out['service_peak_memory_GiB'] = max(sum(s['services'][n]['memory_current'] for n in services if n in s['services']) for s in window) / 2 ** 30
@@ -221,6 +288,8 @@ def search(label, plan, gate=None):
             window = [s for s in samples if level['start_epoch'] <= s['epoch'] <= level['end_epoch'] and db_name(label) in s['services']]
             db_cpu = window[-1]['services'][db_name(label)]['cpu_s'] - window[0]['services'][db_name(label)]['cpu_s'] if len(window) > 1 else None
             levels.append(dict(level, db_cpu_s=db_cpu, db_average_cpus=None if db_cpu is None else db_cpu / level['wall_s'],
+                               gpu=gpu_use(cell, level['start_epoch'], level['end_epoch']),
+                               db_connections=db_connections(cell, level['start_epoch'], level['end_epoch']),
                                gate_use=None if gate is None else gate_use(cell, gate, level['start_epoch'], level['end_epoch']),
                                db_cpu_ms_per_question=None if db_cpu is None else 1000 * db_cpu / level['questions']))
         out[phase] = {'levels': levels,
@@ -306,6 +375,7 @@ def main():
            'search_reference': reference, 'screening': screening,
            'finalize': read(D / 'finalize.json') if (D / 'finalize.json').exists() else None,
            'plan': dict({k: plan[k] for k in ['documents', 'concurrency', 'workers', 'service_cpus', 'client_cpus', 'service_memory', 'search']},
+                        backend=plan.get('backend', 'docker'), device=plan.get('device', 'cpu'), gpu=plan.get('gpu'),
                         measure_all_kept=plan.get('measure_all_kept'), manifest_given=plan.get('manifest_given'),
                         questions_given=plan.get('questions_given'), documents_planned=plan.get('documents_planned'),
                         gate=None if not (plan.get('rr') or {}).get('gate') else {k: plan['rr']['gate'].get(k) for k in [
