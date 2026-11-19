@@ -158,6 +158,17 @@ def main():
         assert summary['questions_given'] == {'given': 3, 'used': 1, 'not_used_by_reason': {
             'its PDF is not among the measured PDFs': 1,
             'its chunk is not among the chunks the reference run returned for its PDF': 1}}, summary['questions_given']
+
+        # Every PDF kept but a given question dropped: the plan's question numbers must still follow.
+        dropped = Path(tmp) / 'dropped'
+        command = folder(dropped)
+        (dropped / 'source/questions-given.jsonl').write_text(''.join(json.dumps(q) + '\n' for q in given))
+        (dropped / 'plan.json').write_text(json.dumps({
+            'documents': 5, 'questions': 3, 'measure_all_kept': True, 'questions_given': 'source/questions-given.jsonl',
+            'search': {'queries': 3, 'warm': 3}, 'cells': [{'label': 'rr-1', 'stage': 'campaign', 'documents': 5}]}))
+        subprocess.run(command, check=True, capture_output=True, text=True)
+        plan = json.loads((dropped / 'plan.json').read_text())
+        assert plan['documents'] == 5 and plan['questions'] == 1 and plan['search'] == {'queries': 1, 'warm': 1}, plan
     print('ok  a fixed list: every kept PDF is measured and nothing fills up; a given question is used only when its '
           'PDF is measured and its chunk is in the reference')
     print('ok  kept: same chunks and vectors within tolerance, and a PDF without text in both systems; left out with its '

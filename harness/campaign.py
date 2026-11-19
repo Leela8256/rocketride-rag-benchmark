@@ -385,10 +385,20 @@ def gate_problems(cfg, out, main, check, runtime):
             problems['gate_records'] = 'a cell that runs the engine as shipped wrote %d gate records' % len(records)
         return problems
     gate = rr['gate']
-    changed = sorted(line.rsplit(':', 1)[0] for line in check.stdout.splitlines() if line.strip().endswith('FAILED'))
+    # Every file the image recorded a hash for that is not reported as OK: changed, missing or unreadable.
+    changed = sorted(line.rsplit(': ', 1)[0] for line in check.stdout.splitlines() if line.strip() and not line.endswith(': OK'))
     runtime.update(release_files_changed=changed, gate=cfg['gate'])
     if changed != [gate['loader']]:
         problems['release_files'] = 'changed files %s; exactly the loader %s is expected' % (changed, gate['loader'])
+    # The changed loader must have been made from the loader of this very engine: the hash the image recorded for
+    # its released loader is the hash of the file the change was made from.
+    recorded = {}
+    for line in in_container('cat', '/opt/rocketride/release-files.sha256').stdout.splitlines():
+        digest, _, name = line.partition(' ')
+        recorded[name.strip().lstrip('*')] = digest
+    if recorded.get(gate['loader']) != gate['original_sha256']:
+        problems['loader_origin'] = {'released_loader_of_this_image': recorded.get(gate['loader']),
+                                     'the_change_was_made_from': gate['original_sha256']}
     for path, key in [('%s/%s' % (rr['engine_dir'], gate['loader']), 'changed_sha256'),
                       ('%s/bench_gate.py' % rr['engine_dir'], 'module_sha256')]:
         found = in_container('sha256sum', path).stdout.split()
@@ -618,7 +628,8 @@ def main():
     try:
         consecutive, stop_reason = {}, {}
         for cfg in cells:
-            arm, label = cfg['arm'], cfg['label']
+            # Failures are counted per system: a RocketRide variant with a replaced lock is a system of its own.
+            arm, label = cfg.get('system', cfg['arm']), cfg['label']
             if finished(label):
                 done.append(label)
                 continue

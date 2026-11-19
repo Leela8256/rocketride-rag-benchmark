@@ -346,8 +346,8 @@ def main():
             rows.append([r['label'], g['limit'], g['calls'], g['most_calls_inside_at_once'],
                          '%.0f %%' % (100 * g['share_of_calls_entering_at_the_limit']), num(g['mean_calls_inside'], 2),
                          num(g['wait_ms']['mean']), num(g['wait_ms']['p95']), num(g['hold_ms']['mean']), num(g['hold_ms']['p95'])])
-        doc += [table(['Run', 'Calls allowed at once', 'Calls', 'Most calls inside at once', 'Calls that entered with the '
-                       'gate full', 'Mean calls inside', 'Waited, mean, ms', 'Waited, 95th percentile, ms',
+        doc += [table(['Run', 'Calls allowed at once', 'Calls', 'Most calls inside at once', 'Calls that took the '
+                       'last free place', 'Mean calls inside', 'Waited, mean, ms', 'Waited, 95th percentile, ms',
                        'Inside, mean, ms', 'Inside, 95th percentile, ms'], rows), '']
 
     doc += ['## Checks', '']
@@ -370,10 +370,11 @@ def main():
                 'Documents committed after their answer: %d. Rows committed after the clock stopped: %d.' % (
                     len(timed), len(stored), sum(r['documents_committed_after_their_answer'] for r in timed),
                     sum(r['rows_committed_after_the_clock_stopped'] for r in timed))),
-            *(['- **Replaced lock:** in %d of %d such runs the engine differed from the release in exactly the one '
-               'loader file, every task ran with the gate size of its run, and no call was inside the model with more '
-               'calls than the gate allows. The runs as shipped were checked to hold no gate module and every release '
-               'file unchanged.' % (sum(1 for r in runs if r.get('gate') is not None and r.get('gate_check')),
+            *(['- **Replaced lock:** in %d of %d such runs, of the three engine files the image keeps a hash of (the '
+               'engine binary, the loader of the embedding model, the store node) only the loader differed from the '
+               'release, it was the file made from this engine\'s own loader with one line changed, and every task '
+               'ran with the gate size of its run. The runs as shipped were checked to hold no gate module and to '
+               'have those three files unchanged.' % (sum(1 for r in runs if r.get('gate') is not None and r.get('gate_check')),
                                     sum(1 for r in runs if r.get('gate') is not None))] if gated else []),
             '- **Search answers:** a response that is not an answer fails its run, so none is in a rate. '
             'Levels where more than %.0f %% of the valid answers held no result: %s.' % (

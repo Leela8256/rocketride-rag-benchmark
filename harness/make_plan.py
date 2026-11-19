@@ -166,15 +166,15 @@ def main():
 
     # Screening: every candidate through both systems without the store. The RocketRide run becomes the reference
     # every later run is checked against, and the questions are cut from the chunks it returns.
+    limit = int(args.cell_hours * 3600)
     screening = {'documents': candidates, 'store': False, 'search': False, 'tolerant': True,
-                 'request_timeout_s': args.screen_request_timeout}
+                 'request_timeout_s': args.screen_request_timeout, 'timeout_s': limit}
     cells = [cell('screen-rr', 'rr', 'screening', make_queries=True, **screening),
              cell('screen-lg', 'lg', 'screening', **screening)]
     # Timed runs, alternating so that neither system always runs first: rr lg lg rr rr lg ...
     order = []
     for i in range(args.repeats):
         order += [('rr', i + 1), ('lg', i + 1)] if i % 2 == 0 else [('lg', i + 1), ('rr', i + 1)]
-    limit = int(args.cell_hours * 3600)
     for i in range(args.repeats):
         for arm, n in order[2 * i:2 * i + 2]:
             cells.append(cell('%s-%d' % (arm, n), arm, 'campaign', args.documents, timeout_s=limit))
@@ -193,6 +193,7 @@ def main():
     if args.questions_file:
         given_questions = [json.loads(x) for x in Path(args.questions_file).read_text().splitlines() if x.strip()]
         assert given_questions and all({'id', 'doc', 'text', 'chunk_sha256'} <= set(q) for q in given_questions)
+        assert all(isinstance(q['id'], int) and not isinstance(q['id'], bool) for q in given_questions), 'a question id is a whole number'
         assert len({q['id'] for q in given_questions}) == len(given_questions), 'two given questions have the same id'
         (out / 'source/questions-given.jsonl').write_text(''.join(json.dumps(q) + '\n' for q in given_questions))
         args.questions = len(given_questions)
