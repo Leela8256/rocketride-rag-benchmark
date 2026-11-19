@@ -10,12 +10,17 @@ RocketRide screening run of the campaign (per_doc.jsonl and vectors.f32 of that 
 
   every expected chunk is in the table;
   no expected chunk is in the table more often than expected;
-  every stored vector equals the reference vector of its chunk within the tolerance the embedding runs use.
+  every stored vector equals the reference vector of its chunk within the tolerance the embedding runs use;
+  the table holds no other row, except the one row RocketRide's store keeps for itself (the plan names it). The
+  campaign removes the warm-up documents and LangGraph's start-up fixture before the timed requests, so any other
+  row is unexplained and fails the check: a search could return it;
+  no document has a row that was committed after the client had that document's answer, and no row was
+  committed after the client's clock stopped. The database keeps the commit time of every row
+  (track_commit_timestamp) and the client records when it sent every document and how long the answer took. So
+  an answer came only after its document was stored, and the timed window holds all of the storing.
 
-Rows whose text is not an expected chunk are counted and reported, not failed: the warm-up documents, the
-LangGraph start-up fixture and a row a store keeps for itself.
-
-Both systems are checked against the same reference, so two passing cells stored the same chunks and vectors.
+Both systems are checked against the same reference, so two passing cells stored the same chunks and vectors, and
+nothing else that a search could return.
 
 What the database did. The statement statistics (pg_stat_statements) are cleared by the host just before the timed
 requests. They are read here first, before this script runs any query of its own on the table: how many inserts,
@@ -32,10 +37,20 @@ import sys
 from pathlib import Path
 
 ATOL, RTOL, DIM = 1e-5, 1e-4, 384
+LATE_S = 0.001      # allowance when a commit time of the database is compared with a time taken by the client
 
 
 def read(path):
     return json.loads(Path(path).read_text())
+
+
+def quoted(text):
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def unhex(text):
+    """A document name the database sent as hex, so that no character of a file name can break a line."""
+    return bytes.fromhex(text).decode('utf-8', 'replace')
 
 
 def main():
@@ -91,15 +106,27 @@ def main():
             ref_vector.setdefault(digest, vectors[start:start + DIM])
     assert seen == wanted, 'the reference run does not cover every document of this cell'
 
+    # Which rows are the store's own, and which document a row belongs to.
+    own_id = plan['rr'].get('own_object_id') if arm == 'rr' else None
+    own = 'objectid IS NOT DISTINCT FROM %s' % quoted(own_id) if own_id else 'false'
+    document = "encode(convert_to(coalesce(%s, ''), 'UTF8'), 'hex')" % ('parent' if arm == 'rr' else "langchain_metadata->>'source'")
     total = int(psql('SELECT count(*) FROM %s' % table))
-    dump = psql("COPY (SELECT encode(sha256(convert_to(content, 'UTF8')), 'hex'), embedding::text FROM %s "
-                "WHERE content IS NOT NULL AND embedding IS NOT NULL) TO STDOUT" % table)
-    found = collections.Counter()
-    worst, outside, compared, other = 0.0, 0, 0, 0
-    for line in dump.splitlines():
-        digest, _, text = line.partition('\t')
+    own_total = int(psql('SELECT count(*) FROM %s WHERE %s' % (table, own)))
+    dump = psql("COPY (SELECT encode(sha256(convert_to(content, 'UTF8')), 'hex'), (%s)::int, %s, embedding::text FROM %s "
+                "WHERE content IS NOT NULL AND embedding IS NOT NULL) TO STDOUT" % (own, document, table))
+    found, unexplained = collections.Counter(), collections.Counter()
+    worst, outside, compared, own_dumped, dumped = 0.0, 0, 0, 0, 0
+    for line in dump.split('\n'):
+        if not line:
+            continue
+        digest, is_own, name, text = line.split('\t', 3)
+        name = unhex(name)
+        dumped += 1
+        if is_own == '1':
+            own_dumped += 1
+            continue
         if digest not in expected:
-            other += 1
+            unexplained[name or '(no document name)'] += 1
             continue
         found[digest] += 1
         values = [float(x) for x in text.strip('[]').split(',')]
@@ -115,6 +142,36 @@ def main():
         outside += bad
     missing = sum((expected - found).values())
     surplus = sum((found - expected).values())
+    # Rows without a text or a vector are not in the dump. Those that are not the store's own are unexplained too.
+    bare = (total - dumped) - (own_total - own_dumped)
+    if bare:
+        unexplained['(rows without a text or a vector)'] += bare
+    rows_unexplained = sum(unexplained.values())
+
+    # Was every document stored before the client had its answer, and every row before the client's clock stopped?
+    # The store's own row is left out: a store may touch it when its task ends.
+    stop = read(out / 'measurement-end.json').get('clock_stop_epoch') if (out / 'measurement-end.json').exists() else None
+    answered = {}                # document -> the moment the client had its answer
+    if (out / 'per_doc.jsonl').exists():
+        for line in (out / 'per_doc.jsonl').read_text().splitlines():
+            row = json.loads(line)
+            if row.get('start_epoch') is not None and row.get('latency_s') is not None:
+                answered[row['doc']] = row['start_epoch'] + row['latency_s']
+    required = 'track_commit_timestamp=on' in db.get('args', [])
+    late = late_documents = last_commit = None
+    compared_documents = 0
+    if psql('SHOW track_commit_timestamp').strip() == 'on':
+        raw = psql("COPY (SELECT %s, extract(epoch FROM max(pg_xact_commit_timestamp(xmin))) FROM %s WHERE NOT (%s) "
+                   "GROUP BY 1) TO STDOUT" % (document, table, own))
+        commits = {unhex(name): float(last) for name, last in (line.split('\t') for line in raw.split('\n') if line) if last != '\\N'}
+        last_commit = max(commits.values()) if commits else None
+        if stop is not None:
+            late = int(psql('SELECT count(*) FROM %s WHERE NOT (%s) AND pg_xact_commit_timestamp(xmin) > to_timestamp(%.6f)' % (
+                table, own, stop + LATE_S)))
+        if answered:
+            compared_documents = sum(1 for name in commits if name in answered)
+            late_documents = sorted(name for name, last in commits.items() if name in answered and last > answered[name] + LATE_S)
+    commit_times_checked = late is not None and late_documents is not None
     # How many times each expected chunk is stored, as a multiple of how often the documents contain it.
     copies = collections.Counter('%g' % (found[h] / expected[h]) for h in expected)
 
@@ -128,7 +185,17 @@ def main():
         'table': table, 'documents': len(names), 'expected_chunks': sum(expected.values()),
         'rows_total': total,
         'rows_matching_an_expected_chunk': sum(found.values()), 'rows_other': total - sum(found.values()),
-        'rows_other_with_text_and_vector': other,
+        'rows_of_the_store_itself': own_total,
+        'rows_unexplained': rows_unexplained,
+        'unexplained_rows_by_document': dict(unexplained.most_common(10)),
+        # None when it could not be checked: the client recorded no times, or the database does not keep commit
+        # times. A plan that starts the database with track_commit_timestamp=on requires the check.
+        'commit_times_checked': commit_times_checked, 'commit_times_required': required,
+        'rows_committed_after_the_clock_stopped': late,
+        'documents_compared_with_their_answer': compared_documents,
+        'documents_committed_after_their_answer': None if late_documents is None else len(late_documents),
+        'first_documents_committed_after_their_answer': (late_documents or [])[:10],
+        'clock_stop_epoch': stop, 'last_row_commit_epoch': last_commit, 'allowance_s': LATE_S,
         'expected_chunks_missing': missing, 'expected_chunks_stored_too_often': surplus, 'copies_of_each_expected_chunk': dict(copies),
         'vectors_compared': compared, 'vectors_outside_tolerance': outside, 'max_abs_difference': worst,
         'tolerance': {'atol': ATOL, 'rtol': RTOL},
@@ -153,12 +220,17 @@ def main():
         'distinct_documents_or_ids_and_rows_without_vector': keys.strip().split('\t'),
         'sample_rows_without_text': sample.splitlines(),
         'reference': str(ref),
-        'pass': missing == 0 and outside == 0 and compared == sum(found.values()) and surplus == 0,
+        'pass': (missing == 0 and outside == 0 and compared == sum(found.values()) and surplus == 0
+                 and rows_unexplained == 0 and own_total <= 1 and not late and not late_documents
+                 and (commit_times_checked or not required)),
     }
     (out / 'db-check.json').write_text(json.dumps(result, indent=2) + '\n')
-    print('DBCHECK', json.dumps({k: result[k] for k in ['table', 'expected_chunks', 'rows_total', 'rows_other',
-                                                         'expected_chunks_missing', 'expected_chunks_stored_too_often',
-                                                         'copies_of_each_expected_chunk', 'vectors_outside_tolerance', 'pass']}))
+    print('DBCHECK', json.dumps({k: result[k] for k in ['table', 'expected_chunks', 'rows_total', 'rows_of_the_store_itself',
+                                                         'rows_unexplained', 'expected_chunks_missing',
+                                                         'expected_chunks_stored_too_often', 'copies_of_each_expected_chunk',
+                                                         'vectors_outside_tolerance', 'commit_times_checked',
+                                                         'rows_committed_after_the_clock_stopped',
+                                                         'documents_committed_after_their_answer', 'pass']}))
 
 
 if __name__ == '__main__':

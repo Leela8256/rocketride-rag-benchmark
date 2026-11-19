@@ -33,8 +33,8 @@ def extract_tika(source_path: str) -> str:
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
         text = resp.read().decode("utf-8", errors="replace")
-    # Tika pads output with blank lines front/back; normalize the frame only,
-    # never interior whitespace (chunk hashes depend on it).
+    # The text is returned exactly as the parser gave it, leading and trailing
+    # blank lines included: the chunk texts must match RocketRide's to the byte.
     return text
 
 

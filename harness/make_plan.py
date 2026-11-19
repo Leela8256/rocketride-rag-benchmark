@@ -3,8 +3,8 @@
 A campaign folder holds everything one benchmark sitting produces. This script writes:
 
   plan.json                     machine layout, images, database settings and one entry per run ("cell")
-  source/corpus-manifest.json   the candidate PDFs (spread evenly over the corpus) and four warm-up PDFs,
-                                with the SHA-256 of every file
+  source/corpus-manifest.json   the candidate PDFs (spread evenly over the corpus, a file with the same bytes as
+                                an earlier one left out) and four warm-up PDFs, with the SHA-256 of every file
 
 Nothing is started here. Standard library only.
 
@@ -18,6 +18,7 @@ under test, 4 for the database, 4 for the load client. Give your own CPU lists o
 import argparse
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -29,6 +30,20 @@ def sha(path):
         for block in iter(lambda: f.read(1 << 20), b''):
             h.update(block)
     return h.hexdigest()
+
+
+def harness_revision():
+    """The commit of this repository, so a campaign records which harness made it. None outside a git checkout."""
+    def git(*args):
+        return subprocess.run(['git', '-C', str(REPO)] + list(args), capture_output=True, text=True)
+    try:
+        head = git('rev-parse', 'HEAD')
+        if head.returncode != 0:
+            return {'commit': None, 'uncommitted_changes': None}
+        changed = git('status', '--porcelain', '--untracked-files=no').stdout.strip()
+    except OSError:                 # no git on this machine
+        return {'commit': None, 'uncommitted_changes': None}
+    return {'commit': head.stdout.strip(), 'uncommitted_changes': bool(changed)}
 
 
 def cell(label, arm, stage, documents, **more):
@@ -46,7 +61,7 @@ def main():
     p.add_argument('--documents', type=int, default=3000, help='PDFs every timed run ingests')
     p.add_argument('--candidates', type=int, help='PDFs the screening runs try (default: documents + 10 %%)')
     p.add_argument('--questions', type=int, default=1000, help='search questions')
-    p.add_argument('--repeats', type=int, default=2, help='timed runs per system')
+    p.add_argument('--repeats', type=int, default=3, help='timed runs per system')
     p.add_argument('--in-flight', type=int, default=64, help='PDFs in flight during ingestion')
     p.add_argument('--engine-threads', type=int, default=32, help='threads of the RocketRide task (1 to 64)')
     p.add_argument('--levels', default='1,8,32', help='questions in flight during search, one level after the other')
@@ -82,18 +97,36 @@ def main():
 
     names = sorted(x.name for x in corpus.glob('*.pdf'))
     assert len(names) >= candidates + 4, 'the corpus has %d PDFs; %d are needed' % (len(names), candidates + 4)
-    # Four PDFs warm every run up and are never measured. The candidates are spread evenly over the rest.
+    # Four PDFs warm every run up and are never measured. The candidates are spread evenly over the rest. A file
+    # with the same bytes as a warm-up file or an earlier candidate is left out and the next file takes its place:
+    # the same document twice would put the same chunks into the table twice.
     warm, rest = names[:4], names[4:]
+    hashes = {n: sha(corpus / n) for n in warm}
+    seen, taken, picked, duplicates = set(hashes.values()), set(), [], []
     step = len(rest) / candidates
-    picked = [rest[int(i * step)] for i in range(candidates)]
+    for i in range(candidates):
+        j = int(i * step)
+        while True:
+            assert j < len(rest), 'the corpus has too few different PDFs: %d of the %d needed' % (len(picked), candidates)
+            name, j = rest[j], j + 1
+            if name in taken:
+                continue
+            taken.add(name)
+            hashes[name] = sha(corpus / name)
+            if hashes[name] not in seen:
+                seen.add(hashes[name])
+                picked.append(name)
+                break
+            duplicates.append(name)
     assert len(set(picked)) == candidates
 
     (out / 'source').mkdir(parents=True)
     (out / 'cells').mkdir()
     manifest = {'measured': picked, 'warm': warm, 'stage': 'candidates',
-                'selection': '%d PDFs spread evenly over the %d files of the corpus by name; the first 4 files warm up' % (
-                    candidates, len(names)),
-                'sha256': {n: sha(corpus / n) for n in picked + warm}}
+                'selection': '%d PDFs spread evenly over the %d files of the corpus by name; the first 4 files warm up; '
+                             '%d files with the same bytes as an earlier one left out' % (candidates, len(names), len(duplicates)),
+                'duplicates_left_out': duplicates,
+                'sha256': {n: hashes[n] for n in picked + warm}}
     (out / 'source/corpus-manifest.json').write_text(json.dumps(manifest) + '\n')
 
     # Screening: every candidate through both systems without the store. The RocketRide run becomes the reference
@@ -108,12 +141,14 @@ def main():
     cells += [cell('%s-%d' % (arm, n), arm, 'campaign', args.documents) for arm, n in order]
 
     plan = {
-        'tag': out.name, 'root': str(out), 'repo': str(REPO), 'corpus': str(corpus),
+        'tag': out.name, 'root': str(out), 'repo': str(REPO), 'harness': harness_revision(), 'corpus': str(corpus),
         'documents': args.documents, 'candidates': candidates, 'questions': args.questions,
         'concurrency': args.in_flight, 'workers': args.engine_threads,
         'service_cpus': args.service_cpus, 'client_cpus': args.client_cpus, 'service_memory': args.service_memory,
         'client_image': args.client_image,
         'rr': {'image': args.rr_image, 'port': 5565, 'engine_dir': '/opt/rocketride/engine',
+               # The one row RocketRide's store keeps in its table for itself. Its own search never returns it.
+               'own_object_id': 'schema',
                'ingest_pipeline': 'ingest.pipe', 'screen_pipeline': 'ingest_no_store.pipe', 'search_pipeline': 'search.pipe',
                # Recorded for every run, so a run shows which engine files it ran.
                'files': ['engine', 'ai/common/models/transformers/sentence_transformers.py', 'nodes/store_postgres/postgres.py',
@@ -121,16 +156,20 @@ def main():
         'lg': {'image': args.lg_image, 'port': 8100, 'parser_image': args.parser_image, 'parser_port': 9998,
                'ingest_pipeline': 'document-pdf-rag-v1', 'screen_pipeline': 'document-pdf-v1',
                'search_pipeline': 'search-pdf-rag-v1',
+               # The document the service stores when it starts, to prove its write path before it reports ready.
+               'fixture_documents': ['warmup.pdf'],
                'files': ['/app/lg_rag_runtime.py', '/app/workload/document/embed.py', '/app/workload/document/store_pg.py',
                          '/app/pipelines/document_pdf_rag/graph.py', '/app/pipelines/search_pdf_rag/graph.py']},
         'db': {'image': args.db_image, 'host': '127.0.0.1', 'port': 5432, 'user': 'postgres', 'database': 'ragbench',
                'cpus': args.db_cpus, 'memory': args.db_memory, 'rr_table': 'rr_chunks', 'lg_table': 'lc_chunks',
                'env_dir': str(env_dir),
                # pg_stat_statements gives the time the database spends per statement. maintenance_work_mem lets the
-               # vector index of the search phase be built in memory.
+               # vector index of the search phase be built in memory. track_commit_timestamp keeps the commit time
+               # of every row, which the read-back compares with the instant the client's clock stopped.
                'args': ['-c', 'listen_addresses=127.0.0.1', '-c', 'port=5432', '-c', 'max_connections=200',
                         '-c', 'shared_buffers=2GB', '-c', 'shared_preload_libraries=pg_stat_statements',
-                        '-c', 'pg_stat_statements.max=5000', '-c', 'maintenance_work_mem=1GB']},
+                        '-c', 'pg_stat_statements.max=5000', '-c', 'maintenance_work_mem=1GB',
+                        '-c', 'track_commit_timestamp=on']},
         'reference_cell': 'cells/screen-rr',
         'search': {'k': args.k, 'queries': args.questions, 'warm': min(16, args.questions), 'levels': levels,
                    # exact: the table as each system leaves it (neither creates a vector index).
@@ -145,7 +184,8 @@ def main():
     assert len(set(labels)) == len(labels)
     (out / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
     print('campaign folder:', out)
-    print('candidates: %d PDFs, %d bytes' % (candidates, sum((corpus / n).stat().st_size for n in picked)))
+    print('candidates: %d PDFs, %d bytes; %d left out as copies of an earlier file' % (
+        candidates, sum((corpus / n).stat().st_size for n in picked), len(duplicates)))
     print('screening:', ' '.join(c['label'] for c in cells if c['stage'] == 'screening'))
     print('campaign: ', ' '.join(c['label'] for c in cells if c['stage'] == 'campaign'))
 

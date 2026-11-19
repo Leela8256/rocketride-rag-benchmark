@@ -11,6 +11,10 @@ Each question is a run of 12 words taken from one stored chunk, so the chunk it 
 are asked for the K nearest chunks. The questions are sent at several numbers in flight, one level after the other,
 and each level sends every question once. Timing covers only those requests.
 
+Every answer is checked before it is counted. An answer with no results is a valid answer; a response that is not
+an answer (an error, another shape) is not, and one such response fails the run. The rates this client reports
+are valid answers per second.
+
 Usage: search_driver.py <cell label> <phase>      phase names the state of the table (for example exact or hnsw)
 """
 import asyncio
@@ -28,6 +32,8 @@ from pathlib import Path
 
 ROOT = Path('/campaign')
 PIPELINES = Path('/pipelines')      # rocketride/pipelines of this repository
+NO_SUCH_DOCUMENT = 'ragbench-no-such-document'      # a document id no table holds
+KEEP = 5                                            # responses kept for inspection, per kind
 
 
 def save(path, value):
@@ -75,31 +81,39 @@ def rr_pipeline(plan):
     return pipe
 
 
-def find_docs(obj):
-    """The first list of result documents inside a RocketRide response, wherever it sits."""
-    if isinstance(obj, list):
-        if obj and all(isinstance(x, dict) and 'page_content' in x for x in obj):
-            return obj
-        for item in obj:
-            found = find_docs(item)
-            if found is not None:
-                return found
-    elif isinstance(obj, dict):
-        for value in obj.values():
-            found = find_docs(value)
-            if found is not None:
-                return found
-    elif isinstance(obj, str) and obj[:1] in '[{' and 'page_content' in obj:
+def rr_answer(response):
+    """The result documents of a RocketRide search answer, or why the response is not an answer.
+
+    Returns (documents, None) or (None, reason).
+
+    client.chat() on the search pipeline returns an object whose `answers` list holds one entry: the result
+    documents of the store's answers lane, as JSON text. A valid answer is exactly that. An empty list of
+    documents is a valid answer too: the store found nothing above its similarity floor. Every other response (an
+    error, no `answers` entry or several, entries that are not documents) is not an answer.
+    """
+    if not isinstance(response, dict):
+        return None, 'the response is a %s, not an object' % type(response).__name__
+    for key in ('error', 'errors'):
+        if response.get(key):
+            return None, 'the response reports %s: %s' % (key, str(response[key])[:200])
+    answers = response.get('answers')
+    if not isinstance(answers, list) or len(answers) != 1:
+        return None, 'the response does not hold exactly one answer (its keys: %s)' % ', '.join(sorted(str(k) for k in response))
+    docs = answers[0]
+    if isinstance(docs, str):
         try:
-            return find_docs(json.loads(obj))
+            docs = json.loads(docs)
         except ValueError:
-            return None
-    return None
+            return None, 'the answer is text, not a list of result documents: %r' % docs[:80]
+    if not isinstance(docs, list):
+        return None, 'the answer is a %s, not a list of result documents' % type(docs).__name__
+    if not all(isinstance(d, dict) and isinstance(d.get('page_content'), str) for d in docs):
+        return None, 'an entry of the answer is not a result document'
+    return docs, None
 
 
-def rr_hits(response):
-    docs = find_docs(response) or []
-    return [{'sha': sha(d.get('page_content')), 'score': d.get('score'),
+def rr_hits(docs):
+    return [{'sha': sha(d['page_content']), 'score': d.get('score'),
              'doc': (d.get('metadata') or {}).get('parent'), 'chunk': (d.get('metadata') or {}).get('chunkId')} for d in docs]
 
 
@@ -117,9 +131,21 @@ def lg_request(port, pipeline, rid, question, k):
     return json.loads(raw), ok, timing
 
 
-def lg_hits(result):
-    return [{'sha': sha(d['text']), 'score': 1 - d['distance'], 'doc': d.get('source'), 'chunk': d.get('chunk')}
-            for d in result['output']['documents']]
+def lg_answer(result, identity_ok):
+    """The result documents of a LangGraph search answer, or why the response is not an answer. Same contract as rr_answer()."""
+    if not identity_ok:
+        return None, 'the response does not carry its request id and the hash of its own body'
+    output = result.get('output') if isinstance(result, dict) else None
+    docs = output.get('documents') if isinstance(output, dict) else None
+    if not isinstance(docs, list):
+        return None, 'the response holds no list of result documents'
+    if not all(isinstance(d, dict) and isinstance(d.get('text'), str) and isinstance(d.get('distance'), (int, float)) for d in docs):
+        return None, 'an entry of the answer is not a result document'
+    return docs, None
+
+
+def lg_hits(docs):
+    return [{'sha': sha(d['text']), 'score': 1 - d['distance'], 'doc': d.get('source'), 'chunk': d.get('chunk')} for d in docs]
 
 
 async def main(label, phase):
@@ -133,7 +159,8 @@ async def main(label, phase):
     assert len(queries) == wanted, 'not enough questions prepared'
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=max(32, max(search['levels']))))
 
-    client = token = None
+    client = token = DocFilter = Question = None
+    kept = {'not_an_answer': [], 'no_result': []}       # the first responses of each kind, for inspection
     if arm == 'rr':
         from rocketride import RocketRideClient
         from rocketride.schema import DocFilter, Question
@@ -148,19 +175,22 @@ async def main(label, phase):
         used = await client.use(pipeline=pipe, threads=plan['workers'], env={'ROCKETRIDE_PG_PASSWORD': os.environ['ROCKETRIDE_PG_PASSWORD']})
         token = used['token']
 
-    async def ask(q):
+    async def ask(q, doc_filter=None):
+        """One question. A failing request raises and stops the run; a response that is not an answer is returned as such."""
         started = time.perf_counter()
         if arm == 'rr':
-            question = Question(filter=DocFilter(limit=k))
+            question = Question(filter=doc_filter or DocFilter(limit=k))
             question.addQuestion(q['text'])
-            response = await client.chat(token=token, question=question)
-            hits, ok, timing = rr_hits(response), True, None
-            raw = response
+            raw = await client.chat(token=token, question=question)
+            docs, problem = rr_answer(raw)
+            hits, timing = rr_hits(docs or []), None
         else:
-            raw, ok, timing = await asyncio.to_thread(lg_request, plan['lg']['port'], plan['lg']['search_pipeline'],
-                                                      'q%d-%s' % (q['id'], uuid.uuid4().hex[:8]), q['text'], k)
-            hits = lg_hits(raw)
-        return {'id': q['id'], 'latency_s': time.perf_counter() - started, 'hits': hits, 'ok': ok, 'timing': timing}, raw
+            raw, identity_ok, timing = await asyncio.to_thread(lg_request, plan['lg']['port'], plan['lg']['search_pipeline'],
+                                                               'q%d-%s' % (q['id'], uuid.uuid4().hex[:8]), q['text'], k)
+            docs, problem = lg_answer(raw, identity_ok)
+            hits = lg_hits(docs or [])
+        return {'id': q['id'], 'latency_s': time.perf_counter() - started, 'hits': hits, 'ok': problem is None,
+                'problem': problem, 'timing': timing}, raw
 
     try:
         # Warm-up, not timed: the first questions also show what a response looks like.
@@ -173,8 +203,23 @@ async def main(label, phase):
 
         warmed = await asyncio.gather(*(warm_one(q) for q in warm))
         save(out / ('search-%s-sample-response.json' % phase), warmed[0][1])
-        assert all(r['ok'] for r, _ in warmed), 'a warm-up answer failed its identity check'
+        problems = sorted({r['problem'] for r, _ in warmed if not r['ok']})
+        assert not problems, 'a warm-up response is not an answer: %s' % '; '.join(problems)
         assert any(r['hits'] for r, _ in warmed), 'warm-up questions returned no results; see the sample response'
+
+        empty_form = None
+        if arm == 'rr':
+            # One question that cannot match: it is limited to a document id no table holds. It shows what this
+            # engine's answer without results looks like, and that rr_answer() reads it as a valid, empty answer.
+            try:
+                probe, raw = await asyncio.wait_for(ask(warm[0], DocFilter(limit=k, objectIds=[NO_SUCH_DOCUMENT])), 600)
+            except Exception as e:      # the engine refused the question: the form stays unconfirmed, the run goes on
+                empty_form = {'confirmed': False, 'why': 'the question could not be asked: %s' % repr(e)[:200]}
+            else:
+                save(out / ('search-%s-empty-answer.json' % phase), raw)
+                assert probe['ok'], ('the answer to a question that cannot match is not read as a valid answer (%s); '
+                                     'see search-%s-empty-answer.json' % (probe['problem'], phase))
+                empty_form = {'confirmed': not probe['hits'], 'results_returned': len(probe['hits'])}
 
         levels, first = [], None
         for in_flight in search['levels']:
@@ -184,42 +229,60 @@ async def main(label, phase):
             async def worker():
                 while queue:
                     q = queue.popleft()
-                    results.append((await asyncio.wait_for(ask(q), 600))[0])
+                    r, raw = await asyncio.wait_for(ask(q), 600)
+                    results.append(r)
+                    kind = 'not_an_answer' if not r['ok'] else 'no_result' if not r['hits'] else None
+                    if kind and len(kept[kind]) < KEEP:
+                        kept[kind].append({'in_flight': in_flight, 'id': r['id'], 'problem': r['problem'], 'response': raw})
 
             before = counters()
+            own = time.process_time()
             begin = time.perf_counter()
             await asyncio.gather(*(worker() for _ in range(in_flight)))
             wall = time.perf_counter() - begin
+            own = time.process_time() - own
             after = counters()
             results.sort(key=lambda r: r['id'])
-            by_id = {r['id']: [h['sha'] for h in r['hits']] for r in results}
+            valid = [r for r in results if r['ok']]
+            by_id = {r['id']: [h['sha'] for h in r['hits']] for r in valid}
             if first is None:
                 first = by_id
                 with (out / ('search-%s-outputs.jsonl' % phase)).open('w') as f:
-                    for r in results:
+                    for r in valid:
                         f.write(json.dumps({'id': r['id'], 'sha': [h['sha'] for h in r['hits']],
                                             'score': [h['score'] for h in r['hits']], 'timing': r['timing']}) + '\n')
             source = {q['id']: q['chunk_sha256'] for q in queries}
-            latencies = [r['latency_s'] * 1000 for r in results]
+            latencies = [r['latency_s'] * 1000 for r in valid]
             cpu = after['cpu_s'] - before['cpu_s']
+            n = max(1, len(valid))
             levels.append({
-                'in_flight': in_flight, 'questions': len(results), 'wall_s': wall, 'questions_per_s': len(results) / wall,
-                'latency_ms': {'p50': percentile(latencies, .5), 'p95': percentile(latencies, .95), 'p99': percentile(latencies, .99),
-                               'mean': sum(latencies) / len(latencies)},
-                'cpu_s': cpu, 'cpu_ms_per_question': 1000 * cpu / len(results), 'average_cpus': cpu / wall,
+                'in_flight': in_flight, 'questions': len(results), 'wall_s': wall,
+                # Only an answer that passed its check counts. A response that is not an answer also fails the run below.
+                'answers_valid': len(valid), 'answers_not_valid': len(results) - len(valid),
+                'questions_per_s': len(valid) / wall,
+                'latency_ms': None if not valid else {
+                    'p50': percentile(latencies, .5), 'p95': percentile(latencies, .95), 'p99': percentile(latencies, .99),
+                    'mean': sum(latencies) / len(latencies)},
+                'cpu_s': cpu, 'cpu_ms_per_question': 1000 * cpu / n, 'average_cpus': cpu / wall,
+                # CPU time of this client process (all its threads) during the level.
+                'client_cpu_s': own, 'client_average_cpus': own / wall,
                 'start_epoch': before['epoch'], 'end_epoch': after['epoch'],
-                'results_per_question': sum(len(v) for v in by_id.values()) / len(by_id),
+                'results_per_question': sum(len(v) for v in by_id.values()) / n,
                 'questions_with_no_result': sum(1 for v in by_id.values() if not v),
-                'source_chunk_first': sum(1 for i, v in by_id.items() if v[:1] == [source[i]]) / len(by_id),
-                'source_chunk_in_results': sum(1 for i, v in by_id.items() if source[i] in v) / len(by_id),
-                'answers_failing_identity_check': sum(1 for r in results if not r['ok']),
-                'questions_differing_from_first_level': sum(1 for i, v in by_id.items() if v != first[i]),
+                'source_chunk_first': sum(1 for i, v in by_id.items() if v[:1] == [source[i]]) / n,
+                'source_chunk_in_results': sum(1 for i, v in by_id.items() if source[i] in v) / n,
+                'questions_differing_from_first_level': sum(1 for i, v in by_id.items() if v != first.get(i)),
             })
-            print('LEVEL', json.dumps({x: levels[-1][x] for x in ['in_flight', 'questions_per_s', 'wall_s']}), flush=True)
+            print('LEVEL', json.dumps({x: levels[-1][x] for x in ['in_flight', 'questions_per_s', 'wall_s', 'answers_not_valid']}), flush=True)
         save(out / ('search-%s.json' % phase), {'label': label, 'arm': arm, 'phase': phase, 'k': k,
-                                                'questions': len(queries), 'levels': levels})
-        assert all(l['questions'] == len(queries) and not l['answers_failing_identity_check'] for l in levels)
+                                                'questions': len(queries), 'empty_answer_form': empty_form, 'levels': levels})
+        assert all(l['questions'] == len(queries) for l in levels), 'a question is missing from the results'
+        bad = sum(l['answers_not_valid'] for l in levels)
+        assert not bad, '%d responses were not answers; see search-%s-answers-to-inspect.json' % (bad, phase)
     finally:
+        # Written here so that it is there also when a later level failed.
+        if kept['not_an_answer'] or kept['no_result']:
+            (out / ('search-%s-answers-to-inspect.json' % phase)).write_text(json.dumps(kept, indent=2, default=repr) + '\n')
         if client:
             if token:
                 try:

@@ -6,8 +6,9 @@ A cell is one run of one system. For every cell this script starts, on the CPUs 
   2. the system under test in a fresh container (RocketRide engine, or the LangGraph service with its parser),
   3. the load client in its own container,
 
-then waits for the warm-up, clears the database statistics, releases the timed ingestion, reads the table back
-(dbcheck.py), runs the search phases (search_driver.py) and removes every container.
+then waits for the warm-up, removes the warm-up rows from the table, clears the database statistics, releases the
+timed ingestion, reads the table back (dbcheck.py), runs the search phases (search_driver.py) and removes every
+container.
 
 Runs on the host with the standard library only. It needs Docker and cgroup v2.
 
@@ -20,6 +21,7 @@ Usage:
 import argparse
 import json
 import os
+import platform
 import secrets
 import subprocess
 import sys
@@ -139,23 +141,58 @@ def table_of(cfg):
     return PLAN['db']['rr_table'] if cfg['arm'] == 'rr' else PLAN['db']['lg_table']
 
 
-def db_prepare(cfg, out):
-    """Between the warm-up and the timed requests: settle the table and clear the database's statistics.
+def quoted(text):
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def warm_up_rows(cfg, warm):
+    """SQL for the rows the warm-up left in the table: (delete them, count the rows that then remain unexplained,
+    name the documents of such rows).
+
+    The warm-up has to write, or it would not warm the store up. Its rows must not stay: a search could return
+    them, and LangGraph's start-up fixture is a document RocketRide never stored. RocketRide's store keeps one row
+    for itself, which its own search never returns; that row stays.
+    """
+    table = table_of(cfg)
+    if cfg['arm'] == 'rr':
+        names = 'ARRAY[%s]' % ', '.join(quoted(n) for n in warm)
+        rest = 'FROM %s WHERE objectid IS DISTINCT FROM %s' % (table, quoted(PLAN['rr']['own_object_id']))
+        return ('DELETE FROM %s WHERE parent = ANY(%s)' % (table, names), 'SELECT count(*) ' + rest,
+                "SELECT coalesce(string_agg(DISTINCT coalesce(parent, '(none)'), ', '), '') FROM (SELECT parent %s LIMIT 50) x" % rest)
+    names = 'ARRAY[%s]' % ', '.join(quoted(n) for n in list(warm) + PLAN['lg']['fixture_documents'])
+    return ("DELETE FROM %s WHERE langchain_metadata->>'source' = ANY(%s)" % (table, names),
+            'SELECT count(*) FROM %s' % table,
+            "SELECT coalesce(string_agg(DISTINCT coalesce(langchain_metadata->>'source', '(none)'), ', '), '') "
+            "FROM (SELECT langchain_metadata FROM %s LIMIT 50) x" % table)
+
+
+def db_prepare(cfg, out, sql=None):
+    """Between the warm-up and the timed requests: empty the table of warm-up rows, settle it and clear the
+    database's statistics.
 
     The table exists by now: both systems create it while they warm up.
     """
+    sql = sql or (lambda text: db_sql(cfg, text))
     table = table_of(cfg)
     started = time.time()
-    # A table that has held its rows for a while has planner statistics and nothing waiting to be written.
-    db_sql(cfg, 'ANALYZE %s' % table)
-    db_sql(cfg, 'CHECKPOINT')
-    done = {'table': table,
-            'rows_before_timed_requests': int(db_sql(cfg, 'SELECT count(*) FROM %s' % table)),
-            'table_bytes_before_timed_requests': int(db_sql(cfg, "SELECT pg_total_relation_size('%s')" % table)),
+    warm = json.loads((R / 'source/corpus-manifest.json').read_text())['warm']
+    delete, remaining, whose = warm_up_rows(cfg, warm)
+    rows_after_warm_up = int(sql('SELECT count(*) FROM %s' % table))
+    sql(delete)
+    unexplained = int(sql(remaining))
+    assert unexplained == 0, ('%d rows of %s are neither warm-up rows nor the store\'s own row; a search could '
+                              'return them. Their documents: %s' % (unexplained, table, sql(whose)[:400]))
+    # A table that has held its rows for a while has no dead rows, has planner statistics and nothing waiting to
+    # be written.
+    sql('VACUUM (ANALYZE) %s' % table)
+    sql('CHECKPOINT')
+    done = {'table': table, 'rows_after_warm_up': rows_after_warm_up,
+            'rows_before_timed_requests': int(sql('SELECT count(*) FROM %s' % table)),
+            'table_bytes_before_timed_requests': int(sql("SELECT pg_total_relation_size('%s')" % table)),
             'prepare_s': time.time() - started}
-    db_sql(cfg, 'SELECT pg_stat_statements_reset()')
-    wal = db_sql(cfg, 'SELECT wal_records, wal_bytes FROM pg_stat_wal').split('\t')
-    counters = db_sql(cfg, 'SELECT xact_commit, xact_rollback FROM pg_stat_database WHERE datname = current_database()').split('\t')
+    sql('SELECT pg_stat_statements_reset()')
+    wal = sql('SELECT wal_records, wal_bytes FROM pg_stat_wal').split('\t')
+    counters = sql('SELECT xact_commit, xact_rollback FROM pg_stat_database WHERE datname = current_database()').split('\t')
     done.update(wal_records=int(wal[0]), wal_bytes=int(wal[1]), xact_commit=int(counters[0]), xact_rollback=int(counters[1]))
     save(out / 'db-prepare.json', done)
 
@@ -265,6 +302,7 @@ def run_cell(cfg, deadline):
     out = R / 'cells' / label
     out.mkdir(parents=True)
     save(out / 'config.json', cfg)
+    save(out / 'harness.json', harness_revision())
     status(state='running', current=label)
     services = service_commands(cfg)
     names = [name for name, _, _ in services]
@@ -349,6 +387,40 @@ def run_cell(cfg, deadline):
             client.kill()
 
 
+def run_quietly(args):
+    try:
+        return subprocess.run([str(a) for a in args], capture_output=True, text=True, timeout=30).stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def harness_revision():
+    """The commit of this repository. Recorded with every run: a campaign that is started again after a change of
+    the harness holds runs of two commits, and the report says so."""
+    head = run_quietly(['git', '-C', REPO, 'rev-parse', 'HEAD'])
+    return {'commit': head, 'uncommitted_changes': None if head is None else bool(
+        run_quietly(['git', '-C', REPO, 'status', '--porcelain', '--untracked-files=no']))}
+
+
+def host_record():
+    """The machine of this sitting, for the report. Every value is read, none is assumed."""
+    def text(path):
+        try:
+            return Path(path).read_text()
+        except OSError:
+            return ''
+    run = run_quietly
+    cpu = text('/proc/cpuinfo')
+    models = sorted({line.split(':', 1)[1].strip() for line in cpu.splitlines() if line.startswith('model name')})
+    cores = {(block.split('physical id', 1)[1].split('\n', 1)[0], block.split('core id', 1)[1].split('\n', 1)[0])
+             for block in cpu.split('\n\n') if 'physical id' in block and 'core id' in block}
+    memory = next((int(line.split()[1]) for line in text('/proc/meminfo').splitlines() if line.startswith('MemTotal')), None)
+    return {'cpu_model': models, 'logical_cpus': os.cpu_count(), 'physical_cores': len(cores) or None,
+            'memory_GiB': None if memory is None else round(memory / 2 ** 20, 1),
+            'kernel': platform.release(), 'machine': platform.machine(),
+            'docker': run(['docker', 'version', '--format', '{{.Server.Version}}']), 'epoch': time.time()}
+
+
 def finished(label):
     out = R / 'cells' / label
     try:
@@ -406,6 +478,7 @@ def main():
     if any(c['stage'] == 'campaign' for c in cells):
         assert manifest.get('stage') == 'final', 'run the screening stage and finalize.py before the timed runs'
     assert not sh(['docker', 'ps', '-q']), 'another container is running on this machine; a timed run needs it to itself'
+    save(R / ('host-%s.json' % (args.stage or 'cells')), host_record())
     deadline = time.time() + args.hours * 3600
     done, failed, skipped = [], [], []
     status(state='starting', current=None, deadline_epoch=deadline)

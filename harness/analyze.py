@@ -9,8 +9,8 @@ For every timed run:
               time per graph step (from the Server-Timing header of every response)
   check       the read-back made by dbcheck.py (db-check.json)
   search      for every state of the table (exact scan, or with the HNSW index) and number of questions in
-              flight: questions per second, latency, CPU of the service, CPU of the database, time inside the
-              database per search, how often the chunk a question was cut from comes back
+              flight: valid answers per second, latency, CPU of the service, of the database and of the load
+              client, time inside the database per search, how often the chunk a question was cut from comes back
   agreement   the result lists of every run compared with the first LangGraph run, question by question.
               RocketRide's store never returns a result under similarity 0.20, so results under 0.20 are left
               out on both sides before comparing.
@@ -117,8 +117,11 @@ def ingestion(label, cfg):
         return out
     start, end, wall = result['start_epoch'], result['end_epoch'], result['wall_s']
     requests = result['documents']
+    images, harness = cell / 'images.json', cell / 'harness.json'
     out.update(valid=True, wall_s=wall, docs_per_s=result['docs_per_s'], requests=requests,
                cpu_s_per_doc=result['cpu_s_per_doc'], average_cpus=result['average_logical_cpus'],
+               client_average_cpus=result.get('client_average_cpus'), images=read(images) if images.exists() else None,
+               harness=read(harness) if harness.exists() else None,
                p50_s=result['latency_s']['p50'], p95_s=result['latency_s']['p95'], start_epoch=start)
     window = [s for s in lines(cell / 'samples.jsonl') if start <= s['epoch'] <= end]
     services = sorted({n for s in window for n in s['services'] if n != db_name(label)})
@@ -145,7 +148,12 @@ def ingestion(label, cfg):
         kinds['SELECT'] = {'calls': kinds['SELECT']['calls'] - own_calls, 'ms': round(kinds['SELECT']['ms'] - own_ms, 1)}
         db_ms = sum(v['ms'] for v in kinds.values())
         out.update(check_pass=check['pass'], expected_chunks=check['expected_chunks'], rows_total=check['rows_total'],
-                   rows_other=check['rows_other'], missing=check['expected_chunks_missing'],
+                   rows_other=check['rows_other'], rows_of_the_store_itself=check['rows_of_the_store_itself'],
+                   rows_unexplained=check['rows_unexplained'],
+                   rows_committed_after_the_clock_stopped=check['rows_committed_after_the_clock_stopped'],
+                   commit_times_checked=check['commit_times_checked'],
+                   documents_committed_after_their_answer=check['documents_committed_after_their_answer'],
+                   missing=check['expected_chunks_missing'],
                    stored_too_often=check['expected_chunks_stored_too_often'],
                    vectors_outside=check['vectors_outside_tolerance'], max_abs_difference=check['max_abs_difference'],
                    indexes=check['database']['indexes'], table_bytes=check['database']['table_bytes'],
@@ -174,6 +182,8 @@ def search(label, plan):
             levels.append(dict(level, db_cpu_s=db_cpu, db_average_cpus=None if db_cpu is None else db_cpu / level['wall_s'],
                                db_cpu_ms_per_question=None if db_cpu is None else 1000 * db_cpu / level['questions']))
         out[phase] = {'levels': levels,
+                      # RocketRide only: was the form of an answer without results confirmed against the engine
+                      'empty_answer_form': read(path).get('empty_answer_form'),
                       # LangGraph only: mean time per step and question at the first level
                       'langgraph_step_ms': server_timing(lines(cell / ('search-%s-outputs.jsonl' % phase))),
                       'db_search_statement': main['query'][:160] if main else None,
@@ -243,7 +253,11 @@ def main():
             if label != Path(plan['reference_cell']).name:
                 screening[label]['against_reference'] = compare_with_reference(D / 'cells' / label, D / plan['reference_cell'])
     status = read(D / 'status.json') if (D / 'status.json').exists() else {}
+    host = next((read(p) for p in [D / 'host-campaign.json', D / 'host-cells.json', D / 'host-screening.json'] if p.exists()), None)
+    # Attempts that failed and were set aside when the run was started again.
+    set_aside = sorted(p.name for p in (D / 'cells').glob('*.failed-*'))
     out = {'tag': plan['tag'], 'campaign': timed, 'runs': runs, 'not_run': [l for l in timed if l not in runs],
+           'harness': plan.get('harness'), 'host': host, 'failed_attempts': set_aside,
            'search_reference': reference, 'screening': screening,
            'finalize': read(D / 'finalize.json') if (D / 'finalize.json').exists() else None,
            'plan': {k: plan[k] for k in ['documents', 'concurrency', 'workers', 'service_cpus', 'client_cpus', 'service_memory', 'search']},
@@ -261,8 +275,8 @@ def main():
             label, r['docs_per_s'], r['cpu_s_per_doc'], r.get('service_peak_own_memory_GiB', 0), r.get('db_ms_per_doc', 0), r.get('check_pass')))
         for phase, s in (r.get('search') or {}).items():
             ag = (r.get('agreement') or {}).get(phase)
-            print('    %-5s ' % phase + ' | '.join('%d in flight: %6.1f q/s p50 %5.0f ms' % (
-                l['in_flight'], l['questions_per_s'], l['latency_ms']['p50']) for l in s['levels'])
+            print('    %-5s ' % phase + ' | '.join('%d in flight: %6.1f valid answers/s p50 %5.0f ms' % (
+                l['in_flight'], l['questions_per_s'], (l['latency_ms'] or {}).get('p50', float('nan'))) for l in s['levels'])
                 + ' | db ms/search %s' % f(s['db_ms_per_search'])
                 + ('' if not ag else ' | same lists as %s: %d of %d' % (ag['against'], ag['identical_lists'], ag['questions'])))
     print('runs analysed %d, valid %d, not run %d' % (len(runs), sum(r['valid'] for r in runs.values()), len(out['not_run'])))

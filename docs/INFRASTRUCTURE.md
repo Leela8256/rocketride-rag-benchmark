@@ -49,11 +49,13 @@ Default plan, for a 32-CPU machine whose CPU `n` and CPU `n + 16` are the two th
 - **Fresh for every run.** Each run starts an empty Postgres container and removes it afterwards, with its data.
   No run sees another run's rows.
 - **Settings.** `shared_buffers=2GB`, `max_connections=200`, `maintenance_work_mem=1GB` (so the vector index of
-  the search phase is built in memory), and `pg_stat_statements` loaded so the database reports the time it
-  spends per statement.
+  the search phase is built in memory), `pg_stat_statements` loaded so the database reports the time it spends
+  per statement, and `track_commit_timestamp=on` so the read-back can compare the commit time of every row with
+  the instant the client's clock stopped.
 - **Extensions.** `vector` and `pg_stat_statements` are created at start by [infra/db-init.sql](../infra/db-init.sql).
 - **Tables.** Each system creates its own table (`rr_chunks`, `lc_chunks`) with its own layout. The harness does
-  not create or alter them, except for the vector index it builds for the second search phase.
+  not create or alter them, with two exceptions: it deletes the rows the warm-up left before the timed requests,
+  and it builds the vector index for the second search phase.
 - **Password.** A new random password per run. It is written to a file outside the campaign folder (mode 0600),
   handed to the containers as an environment file, and deleted when the run ends. It is never printed and never
   stored with the results.
@@ -89,12 +91,14 @@ Any folder of `.pdf` files. The campaign this layout was developed for used PDFs
 collection.
 
 `make_plan.py` takes the first four files by name for warm-up and spreads the candidates evenly over the rest.
-The default plan needs 3,304 PDFs: 3,300 candidates, of which the first 3,000 that pass the screening are used.
+A file with the same bytes as an earlier one is left out and the next file takes its place, so no document is
+stored twice. The default plan needs 3,304 different PDFs: 3,300 candidates, of which the first 3,000 that pass
+the screening are used.
 
 ## How long it takes
 
-On the machine above, the default plan (two screening runs, then two timed runs per system on 3,000 PDFs with
-1,000 questions) takes a few hours. The smoke plan is a matter of minutes once the images exist.
+On the machine above, the default plan (two screening runs, then three timed runs per system on 3,000 PDFs with
+1,000 questions) takes several hours. The smoke plan is a matter of minutes once the images exist.
 
 ## The campaign folder
 
@@ -102,10 +106,13 @@ Everything one sitting produces is in the folder given to `make_plan.py`:
 
 | Path | What it is |
 |---|---|
-| `plan.json` | Machine layout, images, database settings, one entry per run |
-| `source/corpus-manifest.json` | The PDFs with their SHA-256 |
+| `plan.json` | Machine layout, images, database settings, one entry per run, and the commit of this repository |
+| `source/corpus-manifest.json` | The PDFs with their SHA-256, and the files left out as copies |
 | `source/queries.jsonl` | The questions, each with the hash of the chunk it was cut from |
-| `cells/<run>/` | Everything one run wrote: commands, container records, samples, results, logs |
+| `finalize.json` | Which candidates the screening kept, and every one it left out with the reason |
+| `host-screening.json`, `host-campaign.json`, `host-cells.json` | The machine as the harness found it at the start of a stage (or of a start with `--only`): CPU model, CPUs, memory, kernel, Docker version |
+| `cells/<run>/` | Everything one run wrote: commands, container records with image ids, the commit of the harness, samples, results, logs |
+| `cells/<run>.failed-<n>/` | An attempt that failed and was run again. It is kept, and the report lists it. |
 | `status.json` | Which runs completed, failed or were skipped |
 | `analysis.json`, `REPORT.md` | Written by `analyze.py` and `report.py` |
 

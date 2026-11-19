@@ -74,7 +74,7 @@ def create_app(
     settings = settings or Settings.from_env()
     builders = builders if builders is not None else default_builders()
 
-    # Before any heavy import: pin thread env vars.
+    # Applies nothing: the service runs with library defaults (see service/config.py).
     env_pins = configure_runtime(settings)
 
     registry = PipelineRegistry()
@@ -127,11 +127,7 @@ def create_app(
             "ready": bool(app.state.ready),
             "pipelines": registry.names(),
             "uvicorn_workers": settings.uvicorn_workers,
-            "executor_workers": None,
-            "max_inflight_requests": None,
             "request_timeout_seconds": settings.request_timeout_seconds,
-            "torch_threads": None,
-            "torch_interop_threads": None,
             "max_upload_bytes": settings.max_upload_bytes,
             "temp_directory": settings.temp_directory,
             "benchmark_mode": settings.benchmark_mode,

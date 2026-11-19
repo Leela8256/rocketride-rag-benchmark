@@ -1,8 +1,8 @@
-"""Typed settings from env + runtime thread-pinning.
+"""Typed settings from the environment.
 
-configure_runtime() must run before any heavy import (torch, tokenizers):
-the *_NUM_THREADS env pins only take effect if set before those libraries
-initialize.
+No thread setting of any library is applied: configure_runtime() changes
+nothing and returns an empty record, so the service runs with library
+defaults.
 """
 
 import os
@@ -39,11 +39,7 @@ def _to_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    executor_workers: int = 4
-    max_inflight_requests: int = 8
     request_timeout_seconds: int = 300
-    torch_threads: int = 1
-    torch_interop_threads: int = 1
     max_upload_bytes: int = 104_857_600  # 100 MiB
     temp_directory: str = field(default_factory=tempfile.gettempdir)
     pipelines: List[str] = field(default_factory=lambda: ["document-v1"])
@@ -62,11 +58,7 @@ class Settings:
         if not pipelines:
             raise SettingsError("PIPELINES must name at least one pipeline")
         return cls(
-            executor_workers=_to_int(env, "EXECUTOR_WORKERS", 4),
-            max_inflight_requests=_to_int(env, "MAX_INFLIGHT_REQUESTS", 8),
             request_timeout_seconds=_to_int(env, "REQUEST_TIMEOUT_SECONDS", 300),
-            torch_threads=_to_int(env, "TORCH_THREADS", 1),
-            torch_interop_threads=_to_int(env, "TORCH_INTEROP_THREADS", 1),
             max_upload_bytes=_to_int(env, "MAX_UPLOAD_BYTES", 104_857_600),
             temp_directory=env.get("TEMP_DIRECTORY", tempfile.gettempdir()),
             pipelines=pipelines,

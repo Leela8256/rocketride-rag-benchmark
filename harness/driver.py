@@ -270,11 +270,16 @@ async def main(label):
                     failures.append({'doc': name, 'error': repr(e)[:300]})
 
         before = counters()
+        own = time.process_time()
         begin = time.perf_counter()
         save(out / 'measurement-start.json', before)
         await asyncio.gather(*(worker() for _ in range(concurrency)))
         wall = time.perf_counter() - begin
-        after = counters()
+        # The instant the clock stopped. dbcheck.py compares it with the commit time of every stored row: a row
+        # committed later would mean a request was answered before its rows were stored.
+        stopped = time.time()
+        own = time.process_time() - own
+        after = dict(counters(), clock_stop_epoch=stopped)
         save(out / 'measurement-end.json', after)
 
         # Everything below is outside the measured time.
@@ -294,6 +299,8 @@ async def main(label):
             'store': store, 'failures': len(failures),
             'wall_s': wall, 'docs_per_s': len(rows) / wall, 'cpu_s': cpu, 'cpu_s_per_doc': cpu / len(rows),
             'average_logical_cpus': cpu / wall,
+            # CPU time of this client process (all its threads) during the timed requests.
+            'client_cpu_s': own, 'client_average_cpus': own / wall,
             'cpu_by_service_s': {k: after['groups'][k]['cpu_s'] - v['cpu_s'] for k, v in before['groups'].items()},
             'latency_s': {'p50': percentile(latencies, .5), 'p95': percentile(latencies, .95), 'max': max(latencies)},
             'start_epoch': before['epoch'], 'end_epoch': after['epoch'],

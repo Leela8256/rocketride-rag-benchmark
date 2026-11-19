@@ -7,7 +7,8 @@ RUN pip install --no-cache-dir "rocketride==${ROCKETRIDE_CLIENT_VERSION}" \
 # The drivers need these parts of the SDK. The build stops here when a client version lacks one.
 RUN python3 -c "import inspect; from rocketride import RocketRideClient as C; from rocketride.schema import DocFilter, Question; \
 assert 'env' in inspect.signature(C.use).parameters and 'threads' in inspect.signature(C.use).parameters; \
-assert all(hasattr(C, m) for m in ['validate', 'pipe', 'chat', 'terminate']); print('client SDK ok')"
+assert all(hasattr(C, m) for m in ['validate', 'pipe', 'chat', 'terminate']); \
+assert 'limit' in DocFilter.model_fields and 'objectIds' in DocFilter.model_fields; print('client SDK ok')"
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 ENTRYPOINT ["python3", "-u"]

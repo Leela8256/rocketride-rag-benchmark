@@ -95,17 +95,29 @@ before reading a result.
 | | RocketRide `postgres` node, 3.6.0 | LangChain `PGVectorStore`, langchain-postgres 0.0.19 |
 |---|---|---|
 | Connections | One for the pipeline, shared by all threads. One statement or transaction at a time. | A pool that keeps 5 connections and opens up to 10 more under load (SQLAlchemy's defaults) |
+| Who runs a store call | The pipeline thread that holds the document, on the shared connection | One background thread with one event loop for the whole process (`langchain_postgres/v2/engine.py`). Every synchronous call of the store is handed to it. Several statements can wait on the database at the same time, each on its own connection, but the Python part of every call runs on that one thread. |
 | Per document | One transaction: delete the rows of that document id, one `INSERT` per chunk, commit | One `INSERT ... ON CONFLICT` and one commit per chunk |
 | Sending the same document again | Replaces its rows | Adds the rows again under new ids |
 | Index on the document id | None, so the delete scans the table | Not needed for the write |
 | Vector index | None created | None created |
+
+**One store call per document in this pipeline.** `preprocessor_langchain` hands the chunks of a document's
+text to `embedding_transformer` in one call, when the document ends. That node passes its whole buffer on as
+soon as it holds 64 chunks or the document ends, so the text of a document reaches the store in one call and one
+transaction, however many chunks it has. A table the parser recognises is handed on in a call of its own; in the
+runs this benchmark was developed with, the parser returned no tables for PDFs, and the database counted about
+one commit per document.
+
+In 3.6.0 every store call first deletes the rows of the document ids it carries. A document that reached the
+store in several calls would therefore keep only the rows of the last one. The read-back check would report the
+others as missing chunks and fail the run.
 
 ### Searching the store
 
 | | RocketRide `postgres` node, 3.6.0 | LangChain `PGVectorStore` |
 |---|---|---|
 | Query | `SELECT *, embedding <=> q AS distance ... ORDER BY distance LIMIT k` | The library's own nearest-neighbour query |
-| Connections | The same single connection, one search at a time | The same pool |
+| Connections | The same single connection, one search at a time | The same pool, behind the same single background thread |
 | Results it drops | Any under a similarity threshold: 0.5 by default, never under 0.20 | None |
 
 Because of the last row the benchmark sets RocketRide's threshold to 0.20 and leaves out results under 0.20 on
@@ -120,4 +132,9 @@ index itself.
 | | RocketRide | LangGraph side |
 |---|---|---|
 | Transport | One websocket for all requests | One HTTP request each |
+| Load client of this benchmark | The RocketRide client SDK: one event loop, one connection | Python's `urllib` from a thread pool: a new connection for every request |
 | Concurrency inside | The task's threads (32 in the default plan; a task accepts 1 to 64) | The default thread pool of the process |
+
+The transport and the client belong to each stack as it is measured here. A request is timed by the client, from
+sending it to its answer, so the time of the transport is inside every latency. The report shows how much CPU
+the client used in every timed part, to show when a client and not a system sets a rate.
