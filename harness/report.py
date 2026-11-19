@@ -7,7 +7,8 @@ import json
 import sys
 from pathlib import Path
 
-NAMES = {'rr': 'RocketRide', 'lg': 'LangGraph'}
+ARMS = {'rr': 'RocketRide', 'lg': 'LangGraph'}
+NAMES = dict(ARMS)          # by system; main() adds the RocketRide variants with a replaced lock
 PHASES = {'exact': 'No vector index (the table as each system leaves it)',
           'hnsw': 'With a vector index (pgvector HNSW, built by the harness)'}
 CLIENT_NEAR_LIMIT = 0.8     # CPUs. Each client does its Python work on one CPU at a time.
@@ -62,10 +63,15 @@ def verdict(what, by_arm_values):
 
 
 def pairs(runs):
-    """[(n, RocketRide run n, LangGraph run n)] for every n both systems have a valid run of."""
+    """[(RocketRide run, LangGraph run)] for every RocketRide run whose number LangGraph has a valid run of. A
+    RocketRide variant with a replaced lock is paired with the LangGraph run of the same number too."""
     by_label = {r['label']: r for r in runs}
-    numbers = sorted({int(label.split('-')[1]) for label in by_label if label.split('-')[-1].isdigit()})
-    return [(n, by_label['rr-%d' % n], by_label['lg-%d' % n]) for n in numbers if 'rr-%d' % n in by_label and 'lg-%d' % n in by_label]
+    out = []
+    for r in runs:
+        number = r['label'].rsplit('-', 1)[-1]
+        if r['arm'] == 'rr' and number.isdigit() and 'lg-' + number in by_label:
+            out.append((r, by_label['lg-' + number]))
+    return out
 
 
 def share(a, b):
@@ -75,8 +81,17 @@ def share(a, b):
 def main():
     root = Path(sys.argv[1]).resolve()
     a = json.loads((root / 'analysis.json').read_text())
+    for r in a['runs'].values():
+        r.setdefault('system', r['arm'])
     runs = [r for r in a['runs'].values() if r['valid']]
-    by_arm = {arm: [r for r in runs if r['arm'] == arm] for arm in NAMES}
+    # The systems of the campaign: RocketRide as shipped, its variants with a replaced lock (by gate size), LangGraph.
+    gated = sorted({(r['gate'], r['system']) for r in a['runs'].values() if r.get('gate') is not None})
+    if gated:
+        NAMES['rr'] = 'RocketRide as shipped (1 embedding call at once)'
+    order = ['rr'] + [system for _, system in gated] + ['lg']
+    for gate, system in gated:
+        NAMES[system] = 'RocketRide, %d embedding calls at once (lock replaced, not as shipped)' % gate
+    by_arm = {system: [r for r in runs if r['system'] == system] for system in order}
     plan = a['plan']
     levels = plan['search']['levels']
     host, harness = a.get('host') or {}, a.get('harness') or {}
@@ -92,7 +107,11 @@ def main():
     def known(value, unit=''):
         return 'not recorded' if value is None else '%s%s' % (value, unit)
     doc += ['## What was run', '',
-            '- **PDFs per timed run:** %d, with %d in flight during ingestion.' % (plan['documents'], plan['concurrency']),
+            '- **PDFs per timed run:** %d, with %d in flight during ingestion: the client keeps that many requests open '
+            'and sends the next PDF the moment one finishes.%s' % (
+                plan['documents'], plan['concurrency'],
+                '' if not plan.get('manifest_given') else ' The PDFs are the fixed list `%s`; every PDF of it that passed '
+                'the screening is measured.' % plan['manifest_given']),
             '- **Search:** %d questions, %d results asked for per question, sent at %s in flight.' % (
                 plan['search']['queries'], plan['search']['k'], ', '.join(str(x) for x in levels)),
             '- **Service under test:** CPUs `%s`, memory %s. **Database:** `%s` on CPUs `%s`, memory %s. **Client:** CPUs `%s`.' % (
@@ -106,7 +125,13 @@ def main():
                                      '**the runs were taken with %d different commits**: %s' % (len(commits), ', '.join(
                                          '`%s` %s' % (r['label'], (r.get('harness') or {}).get('commit')) for r in runs)))
                                     + (', with uncommitted changes in at least one run' if dirty else '')),
-            '- **RocketRide task threads:** %d. Both systems run as shipped: nothing inside either is changed.' % plan['workers'],
+            '- **RocketRide task threads:** %d. ' % plan['workers'] + (
+                'Both systems run as shipped: nothing inside either is changed.' if not gated else
+                'LangGraph and the RocketRide run named "as shipped" run unchanged. **The RocketRide runs at %s embedding '
+                'calls at once are not as shipped:** in them one line of the engine is changed, so that the lock around '
+                'the embedding model lets that many calls in at once (file `%s`). Everything else is the same image, the '
+                'same pipelines and the same settings.' % (
+                    ' and '.join(str(g) for g, _ in gated), ((plan.get('gate') or {}).get('loader') or 'not recorded'))),
             '- **Memory limits:** the limit of the service under test covers all of RocketRide, parser included. On the '
             'LangGraph side it covers the service; its parser runs in a container of its own without a limit.',
             '- **Load clients:** RocketRide through its client SDK on one websocket; LangGraph over HTTP connections that '
@@ -145,13 +170,13 @@ def main():
                     '. Files left out of the candidate list as copies of an earlier file: %s.' % fin.get('duplicates_left_out_by_the_plan', 'n/a'), '']
             for arm, found in (fin.get('screening_errors') or {}).items():
                 if found:
-                    doc += ['Most frequent errors of the %s screening run: ' % NAMES[arm] +
+                    doc += ['Most frequent errors of the %s screening run: ' % ARMS[arm] +
                             '; '.join('%d times `%s`' % (n, str(e)[:160].replace('`', "'").replace('|', '/')) for e, n in found) + '.', '']
 
     doc += ['## Ingestion', '']
     base = mean([r['docs_per_s'] for r in by_arm['lg']])
     rows = []
-    for arm in NAMES:
+    for arm in order:
         rs = by_arm[arm]
         if not rs:
             continue
@@ -169,7 +194,7 @@ def main():
                    'Verified chunks per second', 'CPU-seconds per PDF',
                    'Peak own memory, GiB', 'Time per PDF, middle value, s', 'Database time per PDF, ms', 'Commits',
                    'Client CPUs busy, highest run'], rows), '']
-    said = verdict('PDFs per second', {arm: [r['docs_per_s'] for r in by_arm[arm]] for arm in NAMES})
+    said = verdict('PDFs per second', {arm: [r['docs_per_s'] for r in by_arm[arm]] for arm in order})
     if said:
         doc += [said + '.', '']
     paired = pairs(runs)
@@ -180,8 +205,8 @@ def main():
             if any(phase in (r.get('search') or {}) for r in runs):
                 header += ['Search %s, %d in flight' % ('without index' if phase == 'exact' else 'with index', n) for n in levels]
         rows = []
-        for n, rr, lg in paired:
-            row = ['rr-%d / lg-%d' % (n, n), share(rr['docs_per_s'], lg['docs_per_s'])]
+        for rr, lg in paired:
+            row = ['%s / %s' % (rr['label'], lg['label']), share(rr['docs_per_s'], lg['docs_per_s'])]
             for phase in PHASES:
                 if any(phase in (r.get('search') or {}) for r in runs):
                     ours, theirs = (rr.get('search') or {}).get(phase), (lg.get('search') or {}).get(phase)
@@ -206,7 +231,7 @@ def main():
         rows, facts, said = [], [], []
         for i, n in enumerate(levels):
             rates = {}
-            for arm in NAMES:
+            for arm in order:
                 rs = [r['search'][phase] for r in by_arm[arm] if phase in (r.get('search') or {})]
                 if not rs:
                     continue
@@ -224,7 +249,7 @@ def main():
                        '95th percentile, ms', 'Service CPUs busy', 'Database CPUs busy', 'Client CPUs busy, highest run'], rows), '']
         if said:
             doc += ['. '.join(said) + '.', '']
-        for arm in NAMES:
+        for arm in order:
             picked = [r for r in by_arm[arm] if phase in (r.get('search') or {})]
             rs = [r['search'][phase] for r in picked]
             if not rs:
@@ -249,7 +274,7 @@ def main():
                 where = 'no index' if phase == 'exact' else 'with the index'
                 many_empty += ['`%s` %s at %d in flight: %d of %d' % (r['label'], where, l['in_flight'], l['questions_with_no_result'], l['answers_valid'])
                                for l in r['search'][phase]['levels'] if l['questions_with_no_result'] > MANY_EMPTY * max(1, l['answers_valid'])]
-                if arm == 'rr':
+                if r['arm'] == 'rr':
                     empty_forms.append((r['label'], where, r['search'][phase].get('empty_answer_form')))
                 client_measured += sum(1 for l in r['search'][phase]['levels'] if l.get('client_average_cpus') is not None)
                 client_busy += [('search, %s' % ('no index' if phase == 'exact' else 'with the index'), r['label'], l['client_average_cpus'])
@@ -276,9 +301,10 @@ def main():
                 if plan.get('plan'):
                     shown.setdefault(label.split('-')[0], (label, plan))
             for arm, (label, plan) in shown.items():
+                arm = ARMS[arm]
                 doc += ['Plan of the search statement %s sent most often (`%s`, taken after the timed questions). It is the '
                         'plan for the statement with placeholders, which can differ from the plan of a search with its real '
-                        'values; the count of index scans above is what shows whether the index was used:' % (NAMES[arm], label),
+                        'values; the count of index scans above is what shows whether the index was used:' % (arm, label),
                         '', '```', plan['query'][:400], '', *plan['plan'][:12], '```', '']
         index = next((r['search'][phase]['index'] for r in runs if (r.get('search') or {}).get(phase, {}).get('index')), None)
         if index:
@@ -309,6 +335,21 @@ def main():
                        'With the index against its own exact scan', 'Source chunk among the results, no index',
                        'Source chunk among the results, with the index'], rows), '']
 
+    with_gate = [r for r in runs if r.get('gate_use')]
+    if with_gate:
+        doc += ['## The runs with a replaced lock: what the gate recorded', '',
+                'During ingestion. A call is one pass of a batch of chunks through the embedding model. "Waited" is the '
+                'time a call stood at the gate, "inside" the time it spent in the model.', '']
+        rows = []
+        for r in with_gate:
+            g = r['gate_use']
+            rows.append([r['label'], g['limit'], g['calls'], g['most_calls_inside_at_once'],
+                         '%.0f %%' % (100 * g['share_of_calls_entering_at_the_limit']), num(g['mean_calls_inside'], 2),
+                         num(g['wait_ms']['mean']), num(g['wait_ms']['p95']), num(g['hold_ms']['mean']), num(g['hold_ms']['p95'])])
+        doc += [table(['Run', 'Calls allowed at once', 'Calls', 'Most calls inside at once', 'Calls that entered with the '
+                       'gate full', 'Mean calls inside', 'Waited, mean, ms', 'Waited, 95th percentile, ms',
+                       'Inside, mean, ms', 'Inside, 95th percentile, ms'], rows), '']
+
     doc += ['## Checks', '']
     stored = [r for r in runs if 'check_pass' in r]
     timed = [r for r in stored if r.get('commit_times_checked')]
@@ -329,6 +370,11 @@ def main():
                 'Documents committed after their answer: %d. Rows committed after the clock stopped: %d.' % (
                     len(timed), len(stored), sum(r['documents_committed_after_their_answer'] for r in timed),
                     sum(r['rows_committed_after_the_clock_stopped'] for r in timed))),
+            *(['- **Replaced lock:** in %d of %d such runs the engine differed from the release in exactly the one '
+               'loader file, every task ran with the gate size of its run, and no call was inside the model with more '
+               'calls than the gate allows. The runs as shipped were checked to hold no gate module and every release '
+               'file unchanged.' % (sum(1 for r in runs if r.get('gate') is not None and r.get('gate_check')),
+                                    sum(1 for r in runs if r.get('gate') is not None))] if gated else []),
             '- **Search answers:** a response that is not an answer fails its run, so none is in a rate. '
             'Levels where more than %.0f %% of the valid answers held no result: %s.' % (
                 100 * MANY_EMPTY, 'none' if not many_empty else '**' + '; '.join(many_empty) + '**. An answer without a result is quick, '
@@ -353,13 +399,13 @@ def main():
     rows = []
     for r in a['runs'].values():
         if not r['valid']:
-            rows.append([r['label'], NAMES[r['arm']], 'no valid result', '', '', '', '', '', '', ''])
+            rows.append([r['label'], NAMES[r['system']], 'no valid result', '', '', '', '', '', '', ''])
             continue
         s = r.get('search') or {}
 
         def rates(phase):
             return 'n/a' if phase not in s else ' / '.join(num(l['questions_per_s']) for l in s[phase]['levels'])
-        rows.append([r['label'], NAMES[r['arm']], num(r['docs_per_s'], 3), num(r['cpu_s_per_doc']),
+        rows.append([r['label'], NAMES[r['system']], num(r['docs_per_s'], 3), num(r['cpu_s_per_doc']),
                      num(r.get('service_peak_own_memory_GiB')), num(r.get('db_ms_per_doc')), r.get('commits', 'n/a'),
                      rates('exact'), rates('hnsw'), 'passed' if r.get('check_pass') else 'FAILED'])
     doc += [table(['Run', 'System', 'Ingestion, PDFs per second', 'CPU-seconds per PDF', 'Peak own memory, GiB',
@@ -368,7 +414,7 @@ def main():
     images = collections.OrderedDict()
     for r in runs:
         for name, image in (r.get('images') or {}).items():
-            role = 'database' if name.endswith('-db') else 'parser of the LangGraph side' if name.endswith('-parser') else NAMES[r['arm']]
+            role = 'database' if name.endswith('-db') else 'parser of the LangGraph side' if name.endswith('-parser') else ARMS[r['arm']]
             images.setdefault(role, set()).add(image[:19])
     if images:
         doc += ['Images the runs used (image id, as Docker reports it): ' +

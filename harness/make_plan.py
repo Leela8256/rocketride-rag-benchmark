@@ -79,6 +79,16 @@ def main():
     p.add_argument('--client-image', default='ragbench-client:latest')
     p.add_argument('--db-image', default='pgvector/pgvector:pg17')
     p.add_argument('--smoke', action='store_true', help='a small plan to check the whole path: 40 PDFs, 30 questions')
+    p.add_argument('--manifest', help='a fixed list of PDFs (JSON with "warm", "measured" and "sha256"): these files in '
+                                      'this order and no other selection; every timed run then ingests all of them '
+                                      'that pass the screening')
+    p.add_argument('--questions-file', help='given questions (JSON lines with id, doc, text, chunk_sha256) to use in '
+                                            'place of the ones cut from the screening run')
+    p.add_argument('--rr-gates', default='', help='also run RocketRide with its embedding lock replaced by a gate of '
+                                                  'these sizes, for example 4,8 (not as shipped; needs --gate-dir)')
+    p.add_argument('--gate-dir', help='folder with bench_gate.py, the changed loader and gate-files.json')
+    p.add_argument('--screen-request-timeout', type=int, default=900, help='seconds one PDF may take in a screening run')
+    p.add_argument('--cell-hours', type=float, default=3.0, help='time limit of the ingestion of one run')
     args = p.parse_args()
 
     if args.smoke:
@@ -87,6 +97,10 @@ def main():
     levels = [int(x) for x in args.levels.split(',')]
     assert 1 <= args.engine_threads <= 64, 'a RocketRide task takes 1 to 64 threads'
     assert candidates >= args.documents and args.repeats >= 1 and levels
+    gates = [int(x) for x in args.rr_gates.split(',') if x.strip()]
+    assert all(g >= 1 for g in gates) and len(set(gates)) == len(gates), 'gate sizes are different positive numbers'
+    assert not gates or args.gate_dir, '--rr-gates needs --gate-dir'
+    assert not (args.manifest and args.smoke), 'a fixed list is used as it is; --smoke picks its own 44 PDFs'
 
     corpus = Path(args.corpus).resolve()
     out = Path(args.out).resolve()
@@ -96,15 +110,35 @@ def main():
     assert out not in env_dir.parents and env_dir != out, 'the password folder must be outside the campaign folder'
 
     names = sorted(x.name for x in corpus.glob('*.pdf'))
-    assert len(names) >= candidates + 4, 'the corpus has %d PDFs; %d are needed' % (len(names), candidates + 4)
+    given = json.loads(Path(args.manifest).read_text()) if args.manifest else None
+    if given:
+        # A fixed list: these warm-up PDFs and these candidates, in this order. Every file must be the file the
+        # list names (SHA-256). Nothing is added and nothing is left out here, not even a file with the same bytes
+        # as another: the list is the definition of the run.
+        warm, picked = list(given['warm']), list(given['measured'])
+        assert len(warm) == 4, 'the client warms up with four PDFs'
+        assert len(set(warm + picked)) == len(warm) + len(picked), 'a name is in the list twice'
+        hashes = {}
+        for n in warm + picked:
+            assert (corpus / n).is_file(), 'not in the corpus folder: %s' % n
+            hashes[n] = sha(corpus / n)
+            assert hashes[n] == given['sha256'][n], 'not the file the list names (SHA-256 differs): %s' % n
+        candidates = args.documents = len(picked)
+        same_bytes = len(picked) + len(warm) - len(set(hashes.values()))
+        selection = ('the %d PDFs of the given list %s in its order, every file verified by SHA-256; its 4 warm-up PDFs; '
+                     '%d of the files have the same bytes as another file of the list and are kept, as the list has them'
+                     % (len(picked), Path(args.manifest).name, same_bytes))
+        duplicates = []
+    assert given or len(names) >= candidates + 4, 'the corpus has %d PDFs; %d are needed' % (len(names), candidates + 4)
     # Four PDFs warm every run up and are never measured. The candidates are spread evenly over the rest. A file
     # with the same bytes as a warm-up file or an earlier candidate is left out and the next file takes its place:
     # the same document twice would put the same chunks into the table twice.
-    warm, rest = names[:4], names[4:]
-    hashes = {n: sha(corpus / n) for n in warm}
-    seen, taken, picked, duplicates = set(hashes.values()), set(), [], []
-    step = len(rest) / candidates
-    for i in range(candidates):
+    if not given:
+        warm, rest = names[:4], names[4:]
+        hashes = {n: sha(corpus / n) for n in warm}
+        seen, taken, picked, duplicates = set(hashes.values()), set(), [], []
+        step = len(rest) / candidates
+    for i in range(0 if given else candidates):
         j = int(i * step)
         while True:
             assert j < len(rest), 'the corpus has too few different PDFs: %d of the %d needed' % (len(picked), candidates)
@@ -122,33 +156,61 @@ def main():
 
     (out / 'source').mkdir(parents=True)
     (out / 'cells').mkdir()
-    manifest = {'measured': picked, 'warm': warm, 'stage': 'candidates',
-                'selection': '%d PDFs spread evenly over the %d files of the corpus by name; the first 4 files warm up; '
-                             '%d files with the same bytes as an earlier one left out' % (candidates, len(names), len(duplicates)),
+    if not given:
+        selection = ('%d PDFs spread evenly over the %d files of the corpus by name; the first 4 files warm up; '
+                     '%d files with the same bytes as an earlier one left out' % (candidates, len(names), len(duplicates)))
+    manifest = {'measured': picked, 'warm': warm, 'stage': 'candidates', 'selection': selection,
                 'duplicates_left_out': duplicates,
                 'sha256': {n: hashes[n] for n in picked + warm}}
     (out / 'source/corpus-manifest.json').write_text(json.dumps(manifest) + '\n')
 
     # Screening: every candidate through both systems without the store. The RocketRide run becomes the reference
     # every later run is checked against, and the questions are cut from the chunks it returns.
-    screening = {'documents': candidates, 'store': False, 'search': False, 'tolerant': True, 'request_timeout_s': 900}
+    screening = {'documents': candidates, 'store': False, 'search': False, 'tolerant': True,
+                 'request_timeout_s': args.screen_request_timeout}
     cells = [cell('screen-rr', 'rr', 'screening', make_queries=True, **screening),
              cell('screen-lg', 'lg', 'screening', **screening)]
     # Timed runs, alternating so that neither system always runs first: rr lg lg rr rr lg ...
     order = []
     for i in range(args.repeats):
         order += [('rr', i + 1), ('lg', i + 1)] if i % 2 == 0 else [('lg', i + 1), ('rr', i + 1)]
-    cells += [cell('%s-%d' % (arm, n), arm, 'campaign', args.documents) for arm, n in order]
+    limit = int(args.cell_hours * 3600)
+    for i in range(args.repeats):
+        for arm, n in order[2 * i:2 * i + 2]:
+            cells.append(cell('%s-%d' % (arm, n), arm, 'campaign', args.documents, timeout_s=limit))
+        # RocketRide with its embedding lock replaced by a gate of N calls at once. Not as shipped. The system is
+        # still `rr` (same pipelines, same screening run, same checks); `system` names the variant in the report.
+        for g in gates:
+            cells.append(cell('rr-g%d-%d' % (g, i + 1), 'rr', 'campaign', args.documents, timeout_s=limit,
+                              gate=g, system='rr-g%d' % g))
+    gate = None
+    if gates:
+        gate_dir = Path(args.gate_dir).expanduser().resolve()
+        record = json.loads((gate_dir / 'gate-files.json').read_text())
+        for name, key in [('bench_gate.py', 'module_sha256'), ('sentence_transformers.py', 'changed_sha256')]:
+            assert sha(gate_dir / name) == record[key], '%s is not the file gate-files.json describes' % name
+        gate = dict(record, dir=str(gate_dir))
+    if args.questions_file:
+        given_questions = [json.loads(x) for x in Path(args.questions_file).read_text().splitlines() if x.strip()]
+        assert given_questions and all({'id', 'doc', 'text', 'chunk_sha256'} <= set(q) for q in given_questions)
+        assert len({q['id'] for q in given_questions}) == len(given_questions), 'two given questions have the same id'
+        (out / 'source/questions-given.jsonl').write_text(''.join(json.dumps(q) + '\n' for q in given_questions))
+        args.questions = len(given_questions)
 
     plan = {
         'tag': out.name, 'root': str(out), 'repo': str(REPO), 'harness': harness_revision(), 'corpus': str(corpus),
         'documents': args.documents, 'candidates': candidates, 'questions': args.questions,
+        # A fixed list: the timed runs ingest every PDF of it that passes the screening, however many those are.
+        'measure_all_kept': bool(given), 'manifest_given': Path(args.manifest).name if given else None,
+        'questions_given': 'source/questions-given.jsonl' if args.questions_file else None,
         'concurrency': args.in_flight, 'workers': args.engine_threads,
         'service_cpus': args.service_cpus, 'client_cpus': args.client_cpus, 'service_memory': args.service_memory,
         'client_image': args.client_image,
         'rr': {'image': args.rr_image, 'port': 5565, 'engine_dir': '/opt/rocketride/engine',
                # The one row RocketRide's store keeps in its table for itself. Its own search never returns it.
                'own_object_id': 'schema',
+               # Only for the runs with `gate` in their entry: the two files mounted into the engine container.
+               'gate': gate,
                'ingest_pipeline': 'ingest.pipe', 'screen_pipeline': 'ingest_no_store.pipe', 'search_pipeline': 'search.pipe',
                # Recorded for every run, so a run shows which engine files it ran.
                'files': ['engine', 'ai/common/models/transformers/sentence_transformers.py', 'nodes/store_postgres/postgres.py',

@@ -131,6 +131,35 @@ def main():
         assert summary['duplicates_left_out_by_the_plan'] == 1
         questions = [json.loads(x) for x in (root / 'source/queries.jsonl').read_text().splitlines()]
         assert len(questions) == 2 and {q['doc'] for q in questions} <= set(manifest['measured'])
+
+        # A fixed list: every kept PDF is measured, and the given questions are used where they can be.
+        fixed = Path(tmp) / 'fixed'
+        command = folder(fixed)
+        digest = hashlib.sha256(b'a.pdf chunk 1').hexdigest()
+        given = [{'id': 4, 'doc': 'a.pdf', 'text': 'from a', 'chunk_sha256': digest, 'extra': 1},
+                 {'id': 5, 'doc': 'd.pdf', 'text': 'from a PDF the screening left out', 'chunk_sha256': 'x'},
+                 {'id': 6, 'doc': 'b.pdf', 'text': 'from a chunk b.pdf does not have', 'chunk_sha256': digest}]
+        (fixed / 'source/questions-given.jsonl').write_text(''.join(json.dumps(q) + '\n' for q in given))
+        (fixed / 'plan.json').write_text(json.dumps({
+            'documents': 9, 'questions': 3, 'measure_all_kept': True, 'questions_given': 'source/questions-given.jsonl',
+            'search': {'queries': 3, 'warm': 3},
+            'cells': [{'label': 'screen-rr', 'stage': 'screening', 'documents': 9},
+                      {'label': 'rr-1', 'stage': 'campaign', 'documents': 9},
+                      {'label': 'rr-g4-1', 'stage': 'campaign', 'documents': 9}]}))
+        subprocess.run(command, check=True, capture_output=True, text=True)
+        summary, plan = json.loads((fixed / 'finalize.json').read_text()), json.loads((fixed / 'plan.json').read_text())
+        manifest = json.loads((fixed / 'source/corpus-manifest.json').read_text())
+        assert manifest['measured'] == ['a.pdf', 'b.pdf', 'c.pdf', 'g.pdf', 'i.pdf'] and summary['measured'] == 5
+        assert plan['documents'] == 5 and plan['documents_planned'] == 9 and plan['questions'] == 1
+        assert plan['search'] == {'queries': 1, 'warm': 1}
+        assert [c['documents'] for c in plan['cells']] == [9, 5, 5], 'the screening entry keeps its number'
+        questions = [json.loads(x) for x in (fixed / 'source/queries.jsonl').read_text().splitlines()]
+        assert questions == [{'id': 4, 'doc': 'a.pdf', 'text': 'from a', 'chunk_sha256': digest}], questions
+        assert summary['questions_given'] == {'given': 3, 'used': 1, 'not_used_by_reason': {
+            'its PDF is not among the measured PDFs': 1,
+            'its chunk is not among the chunks the reference run returned for its PDF': 1}}, summary['questions_given']
+    print('ok  a fixed list: every kept PDF is measured and nothing fills up; a given question is used only when its '
+          'PDF is measured and its chunk is in the reference')
     print('ok  kept: same chunks and vectors within tolerance, and a PDF without text in both systems; left out with its '
           'reason: different vectors, different text, failed, not a valid result')
     print('ok  vector files shorter than their chunks stop the step')

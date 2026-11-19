@@ -100,9 +100,44 @@ def server_timing(rows):
     return {k: v / n for k, v in total.items()} if n else None
 
 
+def percentile(values, p):
+    values = sorted(values)
+    point = (len(values) - 1) * p
+    i = int(point)
+    return values[i] + (values[min(i + 1, len(values) - 1)] - values[i]) * (point - i)
+
+
+def gate_use(cell, limit, start, end):
+    """What the gate of a run with a replaced lock recorded between two instants: one line per call into the model.
+
+    wait: time a call stood at the gate. hold: time it was inside the model. `active` is the number of calls inside
+    when the call entered, itself counted."""
+    waits, holds, active = [], [], collections.Counter()
+    path = cell / 'gate.jsonl'
+    if not path.exists():
+        return None
+    with path.open() as f:
+        for line in f:
+            row = json.loads(line)
+            if start <= row['epoch_ns'] / 1e9 <= end:
+                waits.append(row['wait_ns'] / 1e6)
+                holds.append(row['hold_ns'] / 1e6)
+                active[row['active']] += 1
+    if not holds:
+        return None
+    n = len(holds)
+    return {'limit': limit, 'calls': n, 'most_calls_inside_at_once': max(active),
+            'share_of_calls_entering_at_the_limit': active[limit] / n,
+            # time inside the model summed over all calls, per second of the run: the mean number of calls inside
+            'mean_calls_inside': sum(holds) / 1000 / (end - start),
+            'wait_ms': {'mean': sum(waits) / n, 'p50': percentile(waits, .5), 'p95': percentile(waits, .95)},
+            'hold_ms': {'mean': sum(holds) / n, 'p50': percentile(holds, .5), 'p95': percentile(holds, .95)}}
+
+
 def ingestion(label, cfg):
     cell = D / 'cells' / label
-    out = {'label': label, 'arm': cfg['arm'], 'documents': cfg['documents'], 'valid': False}
+    out = {'label': label, 'arm': cfg['arm'], 'system': cfg.get('system', cfg['arm']), 'gate': cfg.get('gate'),
+           'documents': cfg['documents'], 'valid': False}
     failure = cell / 'failure.json'
     try:
         # cell-ok.json is written last by the campaign: ingestion, the read-back and every search phase passed.
@@ -134,6 +169,10 @@ def ingestion(label, cfg):
             out['db_cpu_s'] = with_db[-1]['services'][db_name(label)]['cpu_s'] - with_db[0]['services'][db_name(label)]['cpu_s']
             out['db_average_cpus'] = out['db_cpu_s'] / wall
             out['db_peak_memory_GiB'] = max(s['services'][db_name(label)]['memory_current'] for s in with_db) / 2 ** 30
+    if cfg.get('gate') is not None:
+        out['gate_use'] = gate_use(cell, cfg['gate'], start, end)
+        gate_file = cell / 'gate-check.json'
+        out['gate_check'] = read(gate_file) if gate_file.exists() else None
     steps = server_timing(lines(cell / 'per_doc.jsonl'))
     if steps:
         out['langgraph_step_ms_per_doc'] = steps
@@ -167,7 +206,7 @@ def ingestion(label, cfg):
     return out
 
 
-def search(label, plan):
+def search(label, plan, gate=None):
     cell = D / 'cells' / label
     samples = lines(cell / 'samples.jsonl')
     out = {}
@@ -182,6 +221,7 @@ def search(label, plan):
             window = [s for s in samples if level['start_epoch'] <= s['epoch'] <= level['end_epoch'] and db_name(label) in s['services']]
             db_cpu = window[-1]['services'][db_name(label)]['cpu_s'] - window[0]['services'][db_name(label)]['cpu_s'] if len(window) > 1 else None
             levels.append(dict(level, db_cpu_s=db_cpu, db_average_cpus=None if db_cpu is None else db_cpu / level['wall_s'],
+                               gate_use=None if gate is None else gate_use(cell, gate, level['start_epoch'], level['end_epoch']),
                                db_cpu_ms_per_question=None if db_cpu is None else 1000 * db_cpu / level['questions']))
         out[phase] = {'levels': levels,
                       # RocketRide only: was the form of an answer without results confirmed against the engine
@@ -238,7 +278,7 @@ def main():
             continue
         row = ingestion(label, cells[label])
         if row['valid'] and cells[label].get('search'):
-            row['search'] = search(label, plan)
+            row['search'] = search(label, plan, cells[label].get('gate'))
         runs[label] = row
     reference = next((l for l in timed if l in runs and runs[l]['valid'] and runs[l]['arm'] == 'lg'), None)
     for label, row in runs.items():
@@ -265,7 +305,11 @@ def main():
            'harness': plan.get('harness'), 'host': host, 'failed_attempts': set_aside,
            'search_reference': reference, 'screening': screening,
            'finalize': read(D / 'finalize.json') if (D / 'finalize.json').exists() else None,
-           'plan': {k: plan[k] for k in ['documents', 'concurrency', 'workers', 'service_cpus', 'client_cpus', 'service_memory', 'search']},
+           'plan': dict({k: plan[k] for k in ['documents', 'concurrency', 'workers', 'service_cpus', 'client_cpus', 'service_memory', 'search']},
+                        measure_all_kept=plan.get('measure_all_kept'), manifest_given=plan.get('manifest_given'),
+                        questions_given=plan.get('questions_given'), documents_planned=plan.get('documents_planned'),
+                        gate=None if not (plan.get('rr') or {}).get('gate') else {k: plan['rr']['gate'].get(k) for k in [
+                            'loader', 'line', 'original_sha256', 'changed_sha256', 'module_sha256']}),
            'db': {k: plan['db'][k] for k in ['image', 'cpus', 'memory']},
            'status': {k: status.get(k) for k in ['state', 'failed', 'skipped']}}
     (D / 'analysis.json').write_text(json.dumps(out, indent=2) + '\n')

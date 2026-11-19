@@ -8,6 +8,7 @@
 
 Usage: python3 tests/test_plan_dry_run.py
 """
+import hashlib
 import json
 import subprocess
 import sys
@@ -19,6 +20,80 @@ REPO = Path(__file__).resolve().parents[1]
 
 def run(*args):
     return subprocess.run([sys.executable] + [str(a) for a in args], check=True, capture_output=True, text=True).stdout
+
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def fixed_list_and_gates(tmp, corpus):
+    """A plan from a given list of PDFs and given questions, with RocketRide runs whose lock is replaced by a gate."""
+    names = sorted(x.name for x in corpus.glob('*.pdf'))
+    # The list has its own order and holds two files with the same bytes (0010 and 0020): both stay.
+    warm, measured = names[50:54], ['0030.pdf', '0010.pdf', '0020.pdf', '0002.pdf', '0041.pdf']
+    listed = {'warm': warm, 'measured': measured, 'sha256': {n: sha(corpus / n) for n in warm + measured}}
+    (tmp / 'list.json').write_text(json.dumps(listed))
+    questions = [{'id': 7, 'doc': '0030.pdf', 'text': 'twelve words', 'chunk_sha256': 'x'},
+                 {'id': 9, 'doc': '0002.pdf', 'text': 'twelve more', 'chunk_sha256': 'y'}]
+    (tmp / 'questions.jsonl').write_text(''.join(json.dumps(q) + '\n' for q in questions))
+    gate = tmp / 'gate'
+    gate.mkdir()
+    (gate / 'bench_gate.py').write_text('# the gate module\n')
+    (gate / 'sentence_transformers.py').write_text('# the loader with its one changed line\n')
+    record = {'loader': 'ai/common/models/transformers/sentence_transformers.py', 'line': 75, 'original_sha256': 'o',
+              'changed_sha256': sha(gate / 'sentence_transformers.py'), 'module_sha256': sha(gate / 'bench_gate.py')}
+    (gate / 'gate-files.json').write_text(json.dumps(record))
+    out = tmp / 'fixed'
+    make = [REPO / 'harness/make_plan.py', '--corpus', corpus, '--manifest', tmp / 'list.json', '--questions-file',
+            tmp / 'questions.jsonl', '--rr-gates', '4,8', '--gate-dir', gate, '--repeats', 1, '--engine-threads', 64,
+            '--db-env-dir', tmp / 'env']
+    run(*make, '--out', out)
+    plan = json.loads((out / 'plan.json').read_text())
+    manifest = json.loads((out / 'source/corpus-manifest.json').read_text())
+    assert manifest['measured'] == measured and manifest['warm'] == warm, 'a given list is used in its own order'
+    assert plan['measure_all_kept'] and plan['documents'] == plan['candidates'] == 5 and plan['workers'] == 64
+    assert plan['questions'] == 2 and plan['search']['queries'] == 2 and plan['questions_given'] == 'source/questions-given.jsonl'
+    assert [json.loads(x)['id'] for x in (out / 'source/questions-given.jsonl').read_text().splitlines()] == [7, 9]
+    cells = {c['label']: c for c in plan['cells']}
+    assert list(cells) == ['screen-rr', 'screen-lg', 'rr-1', 'lg-1', 'rr-g4-1', 'rr-g8-1'], list(cells)
+    assert 'gate' not in cells['rr-1'] and 'gate' not in cells['lg-1'] and 'gate' not in cells['screen-rr']
+    assert (cells['rr-g4-1']['gate'], cells['rr-g4-1']['arm'], cells['rr-g4-1']['system']) == (4, 'rr', 'rr-g4')
+    assert (cells['rr-g8-1']['gate'], cells['rr-g8-1']['system']) == (8, 'rr-g8')
+    timed = run(REPO / 'harness/campaign.py', out, '--stage', 'campaign', '--dry-run')
+    services = {}
+    for line in timed.splitlines():
+        name = line.split('--name ')[1].split()[0] if line.startswith('docker run') else ''
+        if name and not name.endswith('-db') and 'ragbench-client-' not in name:
+            services[name] = line
+    assert set(services) == {'ragbench-rr-1', 'ragbench-lg-1', 'ragbench-lg-1-parser', 'ragbench-rr-g4-1', 'ragbench-rr-g8-1'}
+    for name, line in services.items():
+        mounts = [part.split()[0] for part in line.split(' -v ')[1:]]
+        for banned in ['OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'TORCH_']:
+            assert banned not in line, (banned, line)
+        if '-g' not in name:
+            assert not mounts, 'a run as shipped gets no mount: %s' % line
+            continue
+        label = name[len('ragbench-'):]
+        engine = plan['rr']['engine_dir']
+        assert mounts == ['%s:/cell' % (out / 'cells' / label), '%s/bench_gate.py:%s/bench_gate.py:ro' % (gate, engine),
+                          '%s/sentence_transformers.py:%s/%s:ro' % (gate, engine, record['loader'])], mounts
+        # Apart from the three mounts the command is the command of the run as shipped.
+        plain = line
+        for m in mounts:
+            plain = plain.replace(' -v ' + m, '')
+        assert plain.replace(label, 'rr-1') == services['ragbench-rr-1'], (plain, services['ragbench-rr-1'])
+    # A file that is not the file the list names stops the plan, and so does a gate file that was changed.
+    listed['sha256']['0041.pdf'] = '0' * 64
+    (tmp / 'list.json').write_text(json.dumps(listed))
+    bad = subprocess.run([sys.executable] + [str(a) for a in make] + ['--out', str(tmp / 'bad')], capture_output=True, text=True)
+    assert bad.returncode != 0 and 'SHA-256 differs' in bad.stderr, bad.stderr[-300:]
+    listed['sha256']['0041.pdf'] = sha(corpus / '0041.pdf')
+    (tmp / 'list.json').write_text(json.dumps(listed))
+    (gate / 'sentence_transformers.py').write_text('# another change\n')
+    bad = subprocess.run([sys.executable] + [str(a) for a in make] + ['--out', str(tmp / 'bad2')], capture_output=True, text=True)
+    assert bad.returncode != 0 and 'not the file gate-files.json describes' in bad.stderr, bad.stderr[-300:]
+    print('ok  a given list and given questions are used as they are; runs with a replaced lock get three mounts, '
+          'runs as shipped none')
 
 
 def main():
@@ -78,6 +153,8 @@ def main():
             '--db-env-dir', tmp / 'env')
         full = json.loads((tmp / 'full/plan.json').read_text())
         assert [c['label'] for c in full['cells']] == ['screen-rr', 'screen-lg', 'rr-1', 'lg-1', 'lg-2', 'rr-2', 'rr-3', 'lg-3']
+
+        fixed_list_and_gates(tmp, corpus)
 
     pipes = {}
     for name in ['ingest.pipe', 'ingest_no_store.pipe', 'search.pipe']:

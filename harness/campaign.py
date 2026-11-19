@@ -293,6 +293,11 @@ def service_commands(cfg):
 
     Both systems run as their image ships. Nothing is mounted into the service containers, and no thread setting
     of a math library is passed to either.
+
+    The one exception is a RocketRide cell with `gate` in its entry (not as shipped, and named so in the report):
+    the same image, with the engine's embedding lock replaced by a gate of that many calls at once. Three mounts
+    do it: the cell folder (the gate reads its size there and writes its records), the gate module, and the
+    engine's loader file with its one changed line. Nothing else differs from the shipped cell.
     """
     base = ['docker', 'run', '-d', '--label', 'benchmark.campaign=' + PLAN['tag'], '--network', 'host',
             '--cpuset-cpus', PLAN['service_cpus']]
@@ -300,7 +305,13 @@ def service_commands(cfg):
     name = service_name(cfg)
     if cfg['arm'] == 'rr':
         rr = PLAN['rr']
-        cmd = base + ['--name', name] + limits + [rr['image'], 'ai/eaas.py', '--host=127.0.0.1', '--port=%d' % rr['port']]
+        mounts = []
+        if 'gate' in cfg:
+            gate = rr['gate']
+            mounts = ['-v', '%s:/cell' % (R / 'cells' / cfg['label']),
+                      '-v', '%s/bench_gate.py:%s/bench_gate.py:ro' % (gate['dir'], rr['engine_dir']),
+                      '-v', '%s/sentence_transformers.py:%s/%s:ro' % (gate['dir'], rr['engine_dir'], gate['loader'])]
+        cmd = base + ['--name', name] + limits + mounts + [rr['image'], 'ai/eaas.py', '--host=127.0.0.1', '--port=%d' % rr['port']]
         return [(name, cmd, 'http://127.0.0.1:%d/version' % rr['port'])]
     lg = PLAN['lg']
     # RocketRide's own parser behind a small HTTP server, so that both systems parse a PDF to the same text. It
@@ -342,8 +353,7 @@ def record_runtime(cfg, out, main):
         check = subprocess.run(['docker', 'exec', main, 'sha256sum', '-c', '/opt/rocketride/release-files.sha256'],
                                capture_output=True, text=True)
         runtime['release_files_unchanged'] = check.returncode == 0
-        if check.returncode != 0:
-            problems['release_files'] = (check.stdout + check.stderr).strip()[-400:]
+        problems.update(gate_problems(cfg, out, main, check, runtime))
     else:
         runtime = json.loads(fetch('http://127.0.0.1:%d/__bench/runtime' % PLAN['lg']['port'], 30))
         wanted = {'model_device': 'cpu', 'yappi_running': False, 'affinity': expand(PLAN['service_cpus'])}
@@ -351,6 +361,70 @@ def record_runtime(cfg, out, main):
     save(out / 'runtime.json', runtime)
     save(out / 'runtime-check.json', {'ok': not problems, 'problems': problems})
     assert not problems, 'the service under test is not what the cell asked for: %s' % json.dumps(problems)
+
+
+def gate_records(out):
+    return [json.loads(p.read_text()) for p in sorted(out.glob('gate-runtime-*.json'))]
+
+
+def gate_problems(cfg, out, main, check, runtime):
+    """Is the engine of this cell what the cell asks for: the release untouched, or the release with the one
+    changed loader file and the gate at the cell's size. Called after the warm-up, when the model is loaded."""
+    rr, problems = PLAN['rr'], {}
+
+    def in_container(*args):
+        return subprocess.run(['docker', 'exec', main] + list(args), capture_output=True, text=True)
+    records = gate_records(out)
+    if 'gate' not in cfg:
+        # As shipped: every release file unchanged, no gate module in the container, no gate record written.
+        if check.returncode != 0:
+            problems['release_files'] = (check.stdout + check.stderr).strip()[-400:]
+        if in_container('test', '-e', '%s/bench_gate.py' % rr['engine_dir']).returncode == 0:
+            problems['gate_module'] = 'present in a cell that runs the engine as shipped'
+        if records:
+            problems['gate_records'] = 'a cell that runs the engine as shipped wrote %d gate records' % len(records)
+        return problems
+    gate = rr['gate']
+    changed = sorted(line.rsplit(':', 1)[0] for line in check.stdout.splitlines() if line.strip().endswith('FAILED'))
+    runtime.update(release_files_changed=changed, gate=cfg['gate'])
+    if changed != [gate['loader']]:
+        problems['release_files'] = 'changed files %s; exactly the loader %s is expected' % (changed, gate['loader'])
+    for path, key in [('%s/%s' % (rr['engine_dir'], gate['loader']), 'changed_sha256'),
+                      ('%s/bench_gate.py' % rr['engine_dir'], 'module_sha256')]:
+        found = in_container('sha256sum', path).stdout.split()
+        if not found or found[0] != gate[key]:
+            problems[path] = {'found': found[:1], 'wanted': gate[key]}
+    # One task has loaded the model so far (the ingestion task), so one record exists.
+    if len(records) != 1:
+        problems['gate_records'] = '%d gate records after the warm-up; one is expected' % len(records)
+    for record in records:
+        wanted = {'limit': cfg['gate'], 'affinity': expand(PLAN['service_cpus'])}
+        wrong = {k: {'found': record.get(k), 'wanted': v} for k, v in wanted.items() if record.get(k) != v}
+        # The engine sets TOKENIZERS_PARALLELISM itself. Any other thread setting would be a different experiment.
+        extra = sorted(set(record.get('math_environment') or {}) - {'TOKENIZERS_PARALLELISM'})
+        if extra:
+            wrong['math_environment'] = {'found': record['math_environment'], 'wanted': 'no thread setting'}
+        if wrong:
+            problems['gate_record_%s' % record.get('pid')] = wrong
+    runtime['gate_records'] = records
+    return problems
+
+
+def gate_end_check(cfg, out):
+    """After the last phase: every task of the cell (ingestion and each search phase) ran with the cell's gate
+    size, and no call was ever inside the model with more calls than the gate allows."""
+    records = gate_records(out)
+    if 'gate' not in cfg:
+        assert not records and not (out / 'gate.jsonl').exists(), 'a cell that runs the engine as shipped wrote gate records'
+        return
+    assert records and all(r['limit'] == cfg['gate'] for r in records), 'a task of this cell ran with another gate size'
+    highest = calls = 0
+    with (out / 'gate.jsonl').open() as f:
+        for line in f:
+            calls += 1
+            highest = max(highest, json.loads(line)['active'])
+    assert calls and highest <= cfg['gate'], '%d calls were inside the model at once; the gate allows %d' % (highest, cfg['gate'])
+    save(out / 'gate-check.json', {'gate': cfg['gate'], 'tasks': len(records), 'calls': calls, 'most_calls_inside_at_once': highest})
 
 
 def run_cell(cfg, deadline):
@@ -388,7 +462,7 @@ def run_cell(cfg, deadline):
         save(out / 'images.json', images)
         main = names[-1]
         # A record of which files the service ran, not a check: a file a release does not have is noted, not fatal.
-        files = PLAN['rr']['files'] if cfg['arm'] == 'rr' else PLAN['lg']['files']
+        files = PLAN['rr']['files'] + (['bench_gate.py'] if 'gate' in cfg else []) if cfg['arm'] == 'rr' else PLAN['lg']['files']
         hashed = subprocess.run(['docker', 'exec', main, 'sha256sum'] + files, capture_output=True, text=True)
         (out / 'service-files.sha256').write_text(hashed.stdout + hashed.stderr)
 
@@ -420,6 +494,8 @@ def run_cell(cfg, deadline):
             assert json.loads((out / 'db-check.json').read_text())['pass'], 'the stored rows differ from the reference; see db-check.json'
         if cfg.get('search'):
             search_phases(cfg, out, cmd)
+        if cfg['arm'] == 'rr':
+            gate_end_check(cfg, out)
         result = json.loads((out / 'result.json').read_text())
         # Written last: a cell counts as done only when ingestion, the read-back and every search phase passed.
         save(out / 'cell-ok.json', {'ok': True, 'epoch': time.time()})
@@ -515,8 +591,9 @@ def main():
 
     if args.dry_run:
         for cfg in cells:
-            print('\n# %s  documents=%d in_flight=%d store=%s search=%s' % (
-                cfg['label'], cfg['documents'], PLAN['concurrency'], bool(cfg.get('store')), bool(cfg.get('search'))))
+            print('\n# %s  documents=%d in_flight=%d store=%s search=%s%s' % (
+                cfg['label'], cfg['documents'], PLAN['concurrency'], bool(cfg.get('store')), bool(cfg.get('search')),
+                '  gate=%d (lock replaced, not as shipped)' % cfg['gate'] if 'gate' in cfg else ''))
             groups = {}
             if cfg.get('store'):
                 print(' '.join(db_command(cfg)))

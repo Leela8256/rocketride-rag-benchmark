@@ -9,6 +9,14 @@ The questions were cut by the RocketRide screening run from the chunk texts it r
 12 consecutive words from the middle of one of its chunks. The plan's number of questions is taken, spread evenly
 over the kept PDFs. So for every question the chunk it came from is known.
 
+Two options of the plan change this:
+
+  measure_all_kept   (a fixed list of PDFs was given) every kept candidate is measured, however many those are.
+                     Nothing fills up for a candidate that was left out. The plan's number of PDFs is set to the
+                     number kept.
+  questions_given    the given questions are used in place of the ones cut here. A given question is used when
+                     its PDF was kept and its chunk is one of the chunks the reference run returned for that PDF.
+
 Writes source/corpus-manifest.json (stage "final"), source/queries.jsonl and finalize.json. Standard library only.
 
 Usage: python3 harness/finalize.py <campaign folder>
@@ -77,20 +85,50 @@ def main():
             why[name] = 'the two systems returned different vectors'
         else:
             good.append(name)
+    planned = want
+    if plan.get('measure_all_kept'):
+        want = len(good)
+        assert want, 'no candidate passed the screening'
     assert len(good) >= want, 'only %d candidates passed the screening; %d are needed' % (len(good), want)
     measured = good[:want]
     keep = set(measured)
     pool = [q for q in lines(root / 'cells/screen-rr/queries-all.jsonl') if q['doc'] in keep]
-    assert len(pool) >= questions, 'only %d questions available; %d are needed' % (len(pool), questions)
-    step = len(pool) / questions
-    picked = [dict(pool[int(i * step)], id=i) for i in range(questions)]
+    given_out = None
+    if plan.get('questions_given'):
+        given = lines(root / plan['questions_given'])
+        picked, given_out = [], collections.Counter()
+        for q in given:
+            if q['doc'] not in keep:
+                given_out['its PDF is not among the measured PDFs'] += 1
+            elif q['chunk_sha256'] not in rr[q['doc']]['text_sha256']:
+                given_out['its chunk is not among the chunks the reference run returned for its PDF'] += 1
+            else:
+                picked.append({k: q[k] for k in ['id', 'doc', 'text', 'chunk_sha256']})
+        assert picked, 'none of the given questions can be used'
+        questions = len(picked)
+    else:
+        assert len(pool) >= questions, 'only %d questions available; %d are needed' % (len(pool), questions)
+        step = len(pool) / questions
+        picked = [dict(pool[int(i * step)], id=i) for i in range(questions)]
     (root / 'source/queries.jsonl').write_text(''.join(json.dumps(q) + '\n' for q in picked))
+    if want != plan['documents'] or questions != plan['questions']:
+        # The plan follows what the screening left: every timed run ingests `want` PDFs and asks `questions` questions.
+        plan.update(documents=want, questions=questions, documents_planned=planned)
+        plan['search'].update(queries=questions, warm=min(plan['search']['warm'], questions))
+        for c in plan['cells']:
+            if c['stage'] == 'campaign':
+                c['documents'] = want
+        tmp = root / 'plan.json.tmp'
+        tmp.write_text(json.dumps(plan, indent=2) + '\n')
+        tmp.replace(root / 'plan.json')
     summary = {'candidates': len(candidates), 'kept_by_screening': len(good), 'left_out': why,
                'left_out_by_reason': dict(collections.Counter(why.values()).most_common()),
                'screening_errors': {'rr': errors(root / 'cells/screen-rr/failures.json'),
                                     'lg': errors(root / 'cells/screen-lg/failures.json')},
                'duplicates_left_out_by_the_plan': len(manifest.get('duplicates_left_out', [])),
-               'measured': len(measured),
+               'measured': len(measured), 'measure_all_kept': bool(plan.get('measure_all_kept')),
+               'questions_given': None if given_out is None else {
+                   'given': len(given), 'used': len(picked), 'not_used_by_reason': dict(given_out)},
                'chunks_of_measured': sum(rr[n]['chunks'] for n in measured),
                # PDFs both systems read as holding no text. They are in the timed runs and store no rows.
                'documents_without_chunks': sum(1 for n in measured if not rr[n]['chunks']),
