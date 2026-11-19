@@ -17,6 +17,14 @@ import time
 from pathlib import Path
 
 TICK = os.sysconf('SC_CLK_TCK')
+SMI_TIMEOUT = 30        # seconds one nvidia-smi call may take; a call that fails or hangs raises
+
+
+def smi(args):
+    done = subprocess.run(['nvidia-smi'] + args, capture_output=True, text=True, timeout=SMI_TIMEOUT)
+    if done.returncode != 0:
+        raise RuntimeError('nvidia-smi failed: %s' % (done.stdout + done.stderr).strip()[-200:])
+    return done.stdout
 
 
 def table():
@@ -77,7 +85,9 @@ def usage(roots, procs=None):
         services[name] = {'cpu_s': sum(procs[p][2] + procs[p][3] for p in pids) / TICK,
                           'anon_bytes': anon,
                           'memory_current': anon + max((m.get('RssShmem', 0) for m in mem), default=0),
-                          'os_threads': sum(procs[p][4] for p in pids), 'processes': len(pids)}
+                          'os_threads': sum(procs[p][4] for p in pids), 'processes': len(pids),
+                          # which processes these counters cover; the analysis uses them to tell whose GPU memory is whose
+                          'pids': pids}
     return services
 
 
@@ -106,21 +116,18 @@ def cgroup_cpu_s(path):
 
 def gpu_memory_mib():
     """Memory in use on the first GPU, all processes together."""
-    out = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
-                         capture_output=True, text=True).stdout
-    return int(out.split()[0])
+    return int(smi(['--query-gpu=memory.used', '--format=csv,noheader,nounits']).split()[0])
 
 
 def gpu_apps():
     """{pid: MiB} of every process that holds GPU memory."""
-    out = subprocess.run(['nvidia-smi', '--query-compute-apps=pid,used_memory', '--format=csv,noheader,nounits'],
-                         capture_output=True, text=True).stdout
+    out = smi(['--query-compute-apps=pid,used_memory', '--format=csv,noheader,nounits'])
     return {int(a): int(b) for a, b in (line.split(', ') for line in out.splitlines() if line.strip())}
 
 
 def gpu_busy_processes(ours):
     """Processes that are working the GPU right now and are not ours: [{pid, sm_percent}]."""
-    out = subprocess.run(['nvidia-smi', 'pmon', '-c', '1', '-s', 'u'], capture_output=True, text=True).stdout
+    out = smi(['pmon', '-c', '1', '-s', 'u'])
     busy = []
     for line in out.splitlines():
         f = line.split()
@@ -133,8 +140,7 @@ def gpu_busy_processes(ours):
 
 def gpu_record():
     """What the GPU is, for the machine record."""
-    out = subprocess.run(['nvidia-smi', '--query-gpu=name,driver_version,memory.total', '--format=csv,noheader,nounits'],
-                         capture_output=True, text=True).stdout.strip().splitlines()
+    out = smi(['--query-gpu=name,driver_version,memory.total', '--format=csv,noheader,nounits']).strip().splitlines()
     return [dict(zip(['name', 'driver', 'memory_total_mib'], [x.strip() for x in line.split(',')])) for line in out]
 
 

@@ -146,16 +146,23 @@ def gpu_use(cell, start, end):
         return None
     spec = read(cell / 'services.json') if (cell / 'services.json').exists() else {}
     tenant = spec.get('other_tenant_pid')
-    ours, other = collections.Counter(), collections.Counter()
+    # The processes of the service under test, as the sampler saw them at any moment of the cell (a RocketRide task
+    # is a process of its own, and each search phase starts a new one).
+    under_test = {name for name, s in (spec.get('services') or {}).items() if s.get('under_test')}
+    mine = {pid for s in lines(cell / 'samples.jsonl') for name, v in s['services'].items() if name in under_test
+            for pid in v.get('pids', [])}
+    ours, other, unknown = collections.Counter(), collections.Counter(), collections.Counter()
     for r in lines(cell / 'gpu-procs.jsonl'):
         if start <= r['epoch'] <= end:
-            (other if r['pid'] == tenant else ours)[r['epoch']] += r['mib']
+            (ours if r['pid'] in mine else other if r['pid'] == tenant else unknown)[r['epoch']] += r['mib']
     busy, power = [r['util'] for r in rows], [r['power_w'] for r in rows]
     return {'samples': len(rows), 'busy_mean_percent': sum(busy) / len(busy), 'busy_p50_percent': percentile(busy, .5),
             'busy_p95_percent': percentile(busy, .95), 'busy_max_percent': max(busy),
             'memory_all_users_peak_GiB': max(r['mem_used_mib'] for r in rows) / 1024,
             'service_memory_peak_GiB': max(ours.values()) / 1024 if ours else None,
             'other_tenant_memory_peak_GiB': max(other.values()) / 1024 if other else None,
+            # memory of a process that is neither the service under test nor the known other tenant
+            'unattributed_memory_peak_GiB': max(unknown.values()) / 1024 if unknown else 0.0,
             'power_mean_w': sum(power) / len(power), 'power_max_w': max(power),
             'energy_Wh': sum(power) / len(power) * (end - start) / 3600}
 

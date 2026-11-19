@@ -163,6 +163,15 @@ def psql_prefix(cfg):
     return ['docker', 'exec', db_name(cfg), 'psql', '-U', db['user'], '-d', db['database']]
 
 
+def monitor_prefix():
+    """psql into the cluster's `postgres` database (process backend). The campaign's own readings during a timed
+    part go through it: Postgres keeps statement statistics per database, so a reading made there is not in the
+    statistics of the database the system under test works in."""
+    db = PLAN['db']
+    return [str(Path(PLAN['process']['pg_bin']) / 'psql'), '-h', PLAN['process']['socket_dir'], '-p', str(db['port']),
+            '-U', db['user'], '-d', 'postgres']
+
+
 def pg_env():
     """Environment of the database's own programs. Process backend only: they are unpacked, not installed."""
     return dict(os.environ, LD_LIBRARY_PATH=PLAN['process']['pg_lib']) if process_backend() else None
@@ -609,7 +618,9 @@ def start_db_process(cfg, out, data, live):
     db, p = PLAN['db'], PLAN['process']
     pgbin, sock = Path(p['pg_bin']), Path(p['socket_dir'])
     shutil.rmtree(data, ignore_errors=True)
-    sock.mkdir(parents=True, exist_ok=True)
+    # The local socket lets the cluster's owner in without a password, so only the owner may reach it.
+    sock.mkdir(mode=0o700, parents=True, exist_ok=True)
+    sock.chmod(0o700)
     password = write_settings(cfg)
     pw = Path(env_file(cfg['label']) + '.pw')            # beside the settings file, outside the campaign folder
     with os.fdopen(os.open(pw, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as f:
@@ -622,7 +633,8 @@ def start_db_process(cfg, out, data, live):
         assert init.returncode == 0, 'initdb failed; see the initdb log of the cell'
     finally:
         pw.unlink(missing_ok=True)
-    cmd = ['taskset', '-c', db['cpus'], str(pgbin / 'postgres'), '-D', str(data), '-c', 'unix_socket_directories=' + str(sock)] + db['args']
+    cmd = ['taskset', '-c', db['cpus'], str(pgbin / 'postgres'), '-D', str(data), '-c', 'unix_socket_directories=' + str(sock),
+           '-c', 'unix_socket_permissions=0700'] + db['args']
     save(out / (db_name(cfg) + '-command.json'), cmd)
     proc = live[db_name(cfg)] = subprocess.Popen(cmd, stdout=(out / (db_name(cfg) + '.log')).open('w'), stderr=subprocess.STDOUT,
                                                  stdin=subprocess.DEVNULL, env=pg_env(), start_new_session=True)
@@ -634,6 +646,9 @@ def start_db_process(cfg, out, data, live):
     base = ['-h', str(sock), '-p', str(db['port']), '-U', db['user']]
     subprocess.run([str(pgbin / 'createdb')] + base + [db['database']], check=True, capture_output=True, env=pg_env())
     subprocess.run([str(pgbin / 'psql')] + base + ['-d', db['database'], '-v', 'ON_ERROR_STOP=1', '-f', str(REPO / 'infra/db-init.sql')],
+                   check=True, capture_output=True, env=pg_env())
+    # The statistics view also in the `postgres` database, where the campaign's own readings are made (monitor_prefix).
+    subprocess.run(monitor_prefix() + ['-v', 'ON_ERROR_STOP=1', '-c', 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements'],
                    check=True, capture_output=True, env=pg_env())
     (out / (db_name(cfg) + '-ready.txt')).write_text('pgvector %s\n%s\n' % (
         db_sql(cfg, "SELECT extversion FROM pg_extension WHERE extname = 'vector'"), db_sql(cfg, 'SELECT version()')))
@@ -689,9 +704,18 @@ def process_client(cfg, out):
 
 
 def stop_tree(proc):
-    """End a service: its root, every descendant and every process of its session."""
-    pids = procs.members(procs.table(), proc.pid) or [proc.pid]
+    """End a service: its root, every descendant and every process of its session. Every service is started as the
+    leader of its own session and process group, so the group is signalled too: that reaches its members also when
+    the root has already ended. A root that has ended and been collected is not signalled by its number again."""
+    proc.poll()
+    pids = procs.members(procs.table(), proc.pid) or ([proc.pid] if proc.returncode is None else [])
+    if proc.returncode is not None:
+        pids = [x for x in pids if x != proc.pid]
     for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
         alive = []
         for pid in reversed(pids):
             try:
@@ -711,16 +735,19 @@ def stop_tree(proc):
 
 
 def db_series_row(cfg):
-    """The database's statement statistics since they were last cleared, by kind of statement, and the row counters
-    of the system's table. Reads statistics views only; it does not touch the table."""
+    """The statement statistics of the system's database since they were last cleared, by kind of statement. Read
+    through the `postgres` database, so the reading itself is not among them. A statistics view is read; no table
+    of the system is touched."""
     kinds = {}
-    for line in db_sql(cfg, "SELECT upper(split_part(ltrim(s.query), ' ', 1)), sum(s.calls), round(sum(s.total_exec_time)::numeric, 1) "
-                            "FROM pg_stat_statements s JOIN pg_database d ON d.oid = s.dbid WHERE d.datname = current_database() "
-                            "AND s.query NOT LIKE '%pg_stat_%' GROUP BY 1").splitlines():
+    raw = subprocess.run(monitor_prefix() + ['-At', '-F', '\t', '-v', 'ON_ERROR_STOP=1', '-c',
+                         "SELECT upper(split_part(regexp_replace(ltrim(s.query), '\\s+', ' ', 'g'), ' ', 1)), sum(s.calls), "
+                         "round(sum(s.total_exec_time)::numeric, 1) FROM pg_stat_statements s JOIN pg_database d ON d.oid = s.dbid "
+                         "WHERE d.datname = '%s' AND s.query NOT LIKE '%%pg_stat_%%' GROUP BY 1" % PLAN['db']['database']],
+                         check=True, capture_output=True, text=True, env=pg_env()).stdout
+    for line in raw.splitlines():
         kind, calls, ms = line.split('\t')
         kinds[kind] = {'calls': int(calls), 'ms': float(ms)}
-    rows = db_sql(cfg, "SELECT n_tup_ins, n_tup_del, n_live_tup FROM pg_stat_user_tables WHERE relname = '%s'" % table_of(cfg)).split('\t')
-    return {'epoch': time.time(), 'by_kind': kinds, 'rows_inserted': int(rows[0]), 'rows_deleted': int(rows[1]), 'rows_live': int(rows[2])}
+    return {'epoch': time.time(), 'by_kind': kinds}
 
 
 def wait_client(client, seconds, what, out, series=None):
@@ -730,6 +757,7 @@ def wait_client(client, seconds, what, out, series=None):
     limit = (PLAN.get('gpu') or {}).get('abort_above_mib')
     end = time.monotonic() + seconds
     next_row = time.monotonic()
+    unread = 0
     while client.poll() is None:
         if series is not None and time.monotonic() >= next_row:
             next_row += 30
@@ -742,7 +770,15 @@ def wait_client(client, seconds, what, out, series=None):
             client.kill()
             raise TimeoutError(what + ' timed out')
         if limit:
-            used = procs.gpu_memory_mib()
+            try:
+                used, unread = procs.gpu_memory_mib(), 0
+            except Exception as e:
+                # The limit protects the other users of the card. A run does not go on for long without it.
+                used, unread = 0, unread + 1
+                print('GPU memory could not be read (%d in a row): %s' % (unread, repr(e)[:200]), flush=True)
+                if unread >= 6:
+                    client.kill()
+                    raise RuntimeError('the GPU memory could not be read six times in a row; the run was stopped')
             if used > limit:
                 client.kill()
                 (out / 'gpu-watchdog.txt').write_text('%s GPU memory %d MiB over the limit %d: run stopped\n' % (
@@ -754,7 +790,7 @@ def wait_client(client, seconds, what, out, series=None):
 
 def nvidia_csv_to_jsonl(out):
     """nvidia-smi writes local wall-clock times; turn them into epochs here, on the machine, where the time zone is
-    right. gpu.jsonl: the card every half second. gpu-procs.jsonl: memory per process every 5 s."""
+    right. gpu.jsonl: the card every half second. gpu-procs.jsonl: memory per process every second."""
     def epoch(text):
         return time.mktime(time.strptime(text[:19], '%Y/%m/%d %H:%M:%S')) + float('0' + text[19:])
     rows = []
@@ -838,11 +874,11 @@ def record_runtime_process(cfg, out, live):
 
 
 def gpu_quiet(out, ours, name):
-    """No process but ours may be working the GPU when a timed part starts. Tried for ten minutes, then the cell
-    fails. The readings are kept."""
+    """No process but ours may be working the GPU when a timed part starts. Tried for six minutes, then the cell
+    fails (the load client waits ten minutes for its start signal). The readings are kept."""
     if not PLAN.get('gpu'):
         return
-    for attempt in range(20):
+    for attempt in range(12):
         busy = procs.gpu_busy_processes(ours)
         save(out / name, {'epoch': time.time(), 'attempt': attempt + 1, 'other_processes_working_the_gpu': busy})
         if not busy:
@@ -897,15 +933,16 @@ def run_cell_process(cfg, deadline):
             side.append(subprocess.Popen(['nvidia-smi', '--query-gpu=timestamp,utilization.gpu,memory.used,power.draw',
                                           '--format=csv,nounits', '-lms', '500'], stdout=(out / 'gpu.csv').open('w'), stderr=subprocess.DEVNULL))
             side.append(subprocess.Popen(['nvidia-smi', '--query-compute-apps=timestamp,pid,used_memory', '--format=csv,noheader,nounits',
-                                          '-l', '5'], stdout=(out / 'gpu-procs.csv').open('w'), stderr=subprocess.DEVNULL))
+                                          '-l', '1'], stdout=(out / 'gpu-procs.csv').open('w'), stderr=subprocess.DEVNULL))
         if store:
             # Twice a second, what the system's database connections are doing (active, idle in transaction, idle).
             # A statistics view is read; nothing of the system is touched.
-            watch = subprocess.Popen(psql_prefix(cfg) + ['-At', '-F', '\t', '-q'], stdin=subprocess.PIPE, text=True, env=pg_env(),
+            # Read through the `postgres` database, so the system's database records none of these readings.
+            watch = subprocess.Popen(monitor_prefix() + ['-At', '-F', '\t', '-q'], stdin=subprocess.PIPE, text=True, env=pg_env(),
                                      stdout=(out / 'db-activity.tsv').open('w'), stderr=subprocess.DEVNULL)
             watch.stdin.write("SELECT round(extract(epoch from clock_timestamp())::numeric, 2), state, coalesce(wait_event_type, ''), "
-                              "coalesce(wait_event, ''), count(*) FROM pg_stat_activity WHERE datname = current_database() "
-                              "AND pid <> pg_backend_pid() AND backend_type = 'client backend' GROUP BY 2, 3, 4 \\watch 0.5\n")
+                              "coalesce(wait_event, ''), count(*) FROM pg_stat_activity WHERE datname = '%s' "
+                              "AND backend_type = 'client backend' GROUP BY 2, 3, 4 \\watch 0.5\n" % PLAN['db']['database'])
             watch.stdin.close()
             side.append(watch)
 
@@ -928,8 +965,11 @@ def run_cell_process(cfg, deadline):
             code = wait_client(client, max(60, min(cfg['timeout_s'], deadline - time.time())), 'the ingestion', out,
                                series=cfg if store else None)
             if store:
-                with (out / 'db-series.jsonl').open('a') as f:
-                    f.write(json.dumps(db_series_row(cfg)) + '\n')
+                try:
+                    with (out / 'db-series.jsonl').open('a') as f:
+                        f.write(json.dumps(db_series_row(cfg)) + '\n')
+                except Exception as e:                  # a reading for the analysis, not a condition of the run
+                    print('db series', repr(e)[:200], flush=True)
         assert code == 0, 'client failed; see driver.log'
         assert json.loads((out / 'finished.json').read_text())['ok']
         if store:
@@ -970,7 +1010,10 @@ def run_cell_process(cfg, deadline):
             except subprocess.TimeoutExpired:
                 proc.kill()
         if PLAN.get('gpu'):
-            (out / 'gpu-memory-end-mib.txt').write_text('%d\n' % procs.gpu_memory_mib())
+            try:
+                (out / 'gpu-memory-end-mib.txt').write_text('%d\n' % procs.gpu_memory_mib())
+            except Exception as e:                      # nothing here may keep the services from being stopped
+                print('GPU memory at the end of the cell could not be read:', repr(e)[:200], flush=True)
         for name in reversed(list(live)):
             if name == db_name(cfg):
                 subprocess.run([str(Path(p['pg_bin']) / 'pg_ctl'), 'stop', '-D', str(data), '-m', 'fast', '-w', '-t', '60'],
@@ -981,8 +1024,11 @@ def run_cell_process(cfg, deadline):
         nvidia_csv_to_jsonl(out)
         time.sleep(5)
         left = [port for port in cell_ports(cfg) if listening(port)]
-        save(out / 'after-the-cell.json', {'ports_still_listening': left,
-                                           'gpu_memory_mib': procs.gpu_memory_mib() if PLAN.get('gpu') else None})
+        try:
+            after = procs.gpu_memory_mib() if PLAN.get('gpu') else None
+        except Exception:
+            after = 'not read'
+        save(out / 'after-the-cell.json', {'ports_still_listening': left, 'gpu_memory_mib': after})
 
 
 def run_quietly(args):
@@ -1086,6 +1132,11 @@ def main():
         print('\n%d cells' % len(cells))
         return
 
+    if process_backend():
+        # The services are sessions of their own and would outlive this script. A signal that ends it must first
+        # run the cell's clean-up, which stops them.
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, lambda number, frame: sys.exit(128 + number))
     # This script, the sampler and the docker commands it starts stay on the client CPUs, off the CPUs of the
     # system under test and of the database.
     os.sched_setaffinity(0, expand(PLAN['client_cpus']))

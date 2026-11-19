@@ -25,10 +25,15 @@
 # Usage: PG_BIN=... PG_LIB=... bash infra/stage_processes.sh <stage folder>
 # A second start continues: finished steps leave a marker in <stage>/done and are skipped.
 set -euo pipefail
+: "${PG_BIN:?set PG_BIN}" "${PG_LIB:?set PG_LIB}"
+case "${1:?usage: stage_processes.sh <stage folder>}" in /*) ;; *) echo "give the stage folder as an absolute path"; exit 1 ;; esac
+case "$PG_BIN" in /*) ;; *) echo "PG_BIN must be an absolute path"; exit 1 ;; esac
+case "$PG_LIB" in /*) ;; *) echo "PG_LIB must be an absolute path"; exit 1 ;; esac
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
-STAGE="$(mkdir -p "${1:?usage: stage_processes.sh <stage folder>}" && cd "$1" && pwd)"
-: "${PG_BIN:?set PG_BIN}" "${PG_LIB:?set PG_LIB}"
+STAGE="$(mkdir -p "$1" && cd "$1" && pwd)"
+mkdir -p "$STAGE/tmp"
+export TMPDIR="$STAGE/tmp"      # pip and the compilers put their temporary files here, not in the machine's /tmp
 PORT=5565
 ENGINE_VERSION="${ENGINE_VERSION:-3.6.0}"
 ENGINE_URL="${ENGINE_URL:-https://github.com/rocketride-org/rocketride-server/releases/download/server-v3.6.0/rocketride-server-v3.6.0-linux-x64.tar.gz}"
@@ -96,6 +101,8 @@ fi
 
 if step parser; then
   rm -rf "$STAGE/parser-classes" && mkdir -p "$STAGE/parser-classes"
+  # -source and -target in place of the Dockerfile's --release: a Java runtime without the JDK's signature file
+  # (the usual case when only a runtime is installed) cannot compile with --release.
   CP="$(ls "$DIST"/java/lib/*.jar | tr '\n' ':')"
   "${JAVAC_JAVA:-java}" -m jdk.compiler/com.sun.tools.javac.Main -proc:none -source 17 -target 17 -nowarn -cp "$CP" \
       -d "$STAGE/parser-classes" langgraph/parser/BenchTextServer.java
